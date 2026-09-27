@@ -1,12 +1,12 @@
 #pragma once
 #include "ast.hpp"
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
 #include <sstream>
-#include <cstring>
-#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -17,11 +17,84 @@ struct Value;
 struct Function;
 struct Env;
 
+// ============================================================
+//  Insertion-order map (like JS Map / Python dict).
+//  API-compatible subset of std::map used by the interpreter.
+// ============================================================
+template <typename V>
+class OrderedMapT {
+public:
+    using Pair      = std::pair<std::string, V>;
+    using Container = std::vector<Pair>;
+    using iterator       = typename Container::iterator;
+    using const_iterator = typename Container::const_iterator;
+
+    iterator       begin()       { return items_.begin(); }
+    iterator       end()         { return items_.end(); }
+    const_iterator begin() const { return items_.begin(); }
+    const_iterator end()   const { return items_.end(); }
+
+    iterator find(const std::string& k) {
+        for (auto it = items_.begin(); it != items_.end(); ++it)
+            if (it->first == k) return it;
+        return items_.end();
+    }
+    const_iterator find(const std::string& k) const {
+        for (auto it = items_.begin(); it != items_.end(); ++it)
+            if (it->first == k) return it;
+        return items_.end();
+    }
+
+    size_t count(const std::string& k) const {
+        for (auto& p : items_) if (p.first == k) return 1;
+        return 0;
+    }
+    size_t size()  const { return items_.size(); }
+    bool   empty() const { return items_.empty(); }
+
+    V& operator[](const std::string& k) {
+        for (auto& p : items_) if (p.first == k) return p.second;
+        items_.emplace_back(k, V{});
+        return items_.back().second;
+    }
+
+    size_t erase(const std::string& k) {
+        for (auto it = items_.begin(); it != items_.end(); ++it)
+            if (it->first == k) { items_.erase(it); return 1; }
+        return 0;
+    }
+
+private:
+    Container items_;
+};
+
 using ValueList = std::vector<Value>;
-using ValueMap  = std::map<std::string, Value>;
+using ValueMap  = OrderedMapT<Value>;
 using NativeFn  = std::function<Value(ValueList&)>;
 
-// -------- per-request HTTP response context (set by the server) --------
+// ============================================================
+//  Non-error unwind marker (so `catch(std::exception&)` won't
+//  accidentally swallow return/break/continue/serve).
+// ============================================================
+struct ControlSignal {};
+
+struct ServeSignal : ControlSignal {
+    int port;
+    explicit ServeSignal(int p) : port(p) {}
+};
+
+// ============================================================
+//  Runtime error with optional source location.
+// ============================================================
+struct BiError : std::runtime_error {
+    int line = 0;
+    BiError(const std::string& msg, int ln = 0)
+        : std::runtime_error(msg), line(ln) {}
+};
+
+// ============================================================
+//  HTTP response context (per-thread).
+// ============================================================
 struct Response {
     int status = 200;
     std::string contentType = "text/html; charset=utf-8";
@@ -31,9 +104,9 @@ struct Response {
 
 inline thread_local Response* currentResponse = nullptr;
 
-// Thrown by the `serve(port)` builtin, caught by main().
-struct ServeSignal { int port; };
-
+// ============================================================
+//  Value
+// ============================================================
 struct Value {
     enum Type { NIL, NUM, BOOL, STR, ARR, MAP, FUNC, NATIVE };
 
@@ -91,8 +164,9 @@ struct Env : std::enable_shared_from_this<Env> {
     }
 };
 
-// ---------------- helpers ----------------
-
+// ============================================================
+//  Helpers
+// ============================================================
 inline std::string typeName(const Value& v) {
     switch (v.type) {
         case Value::NIL:    return "null";
@@ -134,7 +208,8 @@ inline std::string toStr(const Value& v) {
         case Value::BOOL: return v.boolean ? "true" : "false";
         case Value::NUM: {
             double d = v.num;
-            if (d == (long long)d && std::fabs(d) < 1e15)
+            // Guard the cast so we never hit UB on huge doubles.
+            if (std::fabs(d) < 9.0e15 && d == (double)(long long)d)
                 return std::to_string((long long)d);
             std::ostringstream os; os << d; return os.str();
         }
@@ -192,15 +267,16 @@ inline bool valueEquals(const Value& a, const Value& b) {
     }
 }
 
-// ---------------- JSON ----------------
-
+// ============================================================
+//  JSON
+// ============================================================
 inline std::string toJson(const Value& v) {
     switch (v.type) {
         case Value::NIL:  return "null";
         case Value::BOOL: return v.boolean ? "true" : "false";
         case Value::NUM: {
             double d = v.num;
-            if (d == (long long)d && std::fabs(d) < 1e15)
+            if (std::fabs(d) < 9.0e15 && d == (double)(long long)d)
                 return std::to_string((long long)d);
             std::ostringstream os; os << d; return os.str();
         }
@@ -216,7 +292,7 @@ inline std::string toJson(const Value& v) {
                     default:
                         if (c < 0x20) {
                             char buf[8];
-                            snprintf(buf, sizeof buf, "\\u%04x", c);
+                            std::snprintf(buf, sizeof buf, "\\u%04x", c);
                             out += buf;
                         } else out += (char)c;
                 }
@@ -254,7 +330,7 @@ struct JsonParser {
     [[noreturn]] void err(const char* m) { throw std::runtime_error(std::string("JSON: ") + m); }
 
     void expect(const char* lit) {
-        size_t n = strlen(lit);
+        size_t n = std::strlen(lit);
         if (s.compare(i, n, lit) != 0) err("bad literal");
         i += n;
     }
@@ -293,7 +369,7 @@ struct JsonParser {
                     case '\\': out += '\\'; break;
                     case 'u': {
                         if (i + 4 > s.size()) err("bad \\u");
-                        int cp = (int)strtol(s.substr(i, 4).c_str(), nullptr, 16);
+                        int cp = (int)std::strtol(s.substr(i, 4).c_str(), nullptr, 16);
                         i += 4;
                         if (cp < 0x80) out += (char)cp;
                         else if (cp < 0x800) {

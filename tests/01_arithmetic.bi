@@ -1,0 +1,6 @@
+assert(1 + 2 == 3, "add")
+assert(10 - 3 == 7, "sub")
+assert(4 * 5 == 20, "mul")
+assert(20 / 4 == 5, "div")
+assert(17 % 5 == 2, "mod")
+assert("a" + "b" == "ab", "concat")

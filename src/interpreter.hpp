@@ -10,12 +10,20 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace bi {
 
-struct ReturnSignal   { Value value; };
-struct BreakSignal    {};
-struct ContinueSignal {};
+struct ReturnSignal : ControlSignal {
+    Value value;
+    explicit ReturnSignal(Value v) : value(std::move(v)) {}
+};
+struct BreakSignal    : ControlSignal {};
+struct ContinueSignal : ControlSignal {};
+struct ThrowSignal    : ControlSignal {
+    Value value;
+    explicit ThrowSignal(Value v) : value(std::move(v)) {}
+};
 
 class Interpreter {
 public:
@@ -29,6 +37,8 @@ public:
 
     const std::vector<std::shared_ptr<Function>>& routes() const { return routes_; }
     std::string baseDir() const { return baseDir_; }
+    const std::string& currentFile() const { return currentFile_; }
+    int currentLine() const { return currentLine_; }
 
     // ---------- loading ----------
 
@@ -44,15 +54,121 @@ public:
     }
 
     void runSource(const std::string& src, const std::string& file) {
+        currentFile_ = file;
         Lexer  lx(src, file);
         Parser ps(lx.run(), file);
         Program prog = ps.parse();
         for (auto& s : prog.body) exec(s, global_);
     }
 
+    // REPL helper: runs src, and if the last statement is an expression,
+    // returns its value (hasValue = true). Otherwise hasValue = false.
+    std::pair<bool, Value> runSourceRepl(const std::string& src, const std::string& file) {
+        currentFile_ = file;
+        Lexer  lx(src, file);
+        Parser ps(lx.run(), file);
+        Program prog = ps.parse();
+
+        bool  hasValue = false;
+        Value last     = vnil();
+
+        for (size_t i = 0; i < prog.body.size(); i++) {
+            auto& s = prog.body[i];
+            if (s->kind == SK::Expr && i + 1 == prog.body.size()) {
+                last = eval(s->expr, global_);
+                hasValue = true;
+            } else {
+                exec(s, global_);
+            }
+        }
+        return { hasValue, last };
+    }
+
     // ---------- evaluation ----------
 
     Value eval(ExprPtr e, std::shared_ptr<Env> env) {
+        int prevLine = currentLine_;
+        currentLine_ = e->line;
+        try {
+            Value v = evalImpl(e, env);
+            currentLine_ = prevLine;
+            return v;
+        } catch (BiError&) {
+            currentLine_ = prevLine;
+            throw;
+        } catch (ControlSignal&) {
+            currentLine_ = prevLine;
+            throw;
+        } catch (std::exception& ex) {
+            int ln = e->line;
+            currentLine_ = prevLine;
+            throw BiError(ex.what(), ln);
+        }
+    }
+
+    // ---------- statements ----------
+
+    void exec(StmtPtr s, std::shared_ptr<Env> env) {
+        int prevLine = currentLine_;
+        currentLine_ = s->line;
+        try {
+            execImpl(s, env);
+            currentLine_ = prevLine;
+        } catch (BiError&) {
+            currentLine_ = prevLine;
+            throw;
+        } catch (ControlSignal&) {
+            currentLine_ = prevLine;
+            throw;
+        } catch (std::exception& ex) {
+            int ln = s->line;
+            currentLine_ = prevLine;
+            throw BiError(ex.what(), ln);
+        }
+    }
+
+    void execBlock(const std::vector<StmtPtr>& body, std::shared_ptr<Env> env) {
+        auto scope = env->child();
+        for (auto& s : body) exec(s, scope);
+    }
+
+    // ---------- calls ----------
+
+    Value call(const Value& fn, ValueList& args) {
+        if (fn.type == Value::NATIVE) return fn.native(args);
+        if (fn.type == Value::FUNC)   return callFunction(fn.func, args);
+        throw std::runtime_error("attempt to call a " + typeName(fn));
+    }
+
+    Value callFunction(std::shared_ptr<Function> f, ValueList& args) {
+        auto env = f->closure->child();
+        for (size_t i = 0; i < f->params.size(); i++)
+            env->define(f->params[i], i < args.size() ? args[i] : vnil());
+
+        auto rest = std::make_shared<ValueList>();
+        for (size_t i = f->params.size(); i < args.size(); i++) rest->push_back(args[i]);
+        env->define("args", varr(rest));
+
+        try {
+            for (auto& s : f->body) exec(s, env);
+        } catch (ReturnSignal& r) {
+            return r.value;
+        }
+        return vnil();
+    }
+
+    // Set by the module loader while executing an imported file.
+    ValueMap* exportSink_ = nullptr;
+
+private:
+    std::shared_ptr<Env> global_;
+    std::string          baseDir_ = ".";
+    std::string          currentFile_;
+    int                  currentLine_ = 0;
+    std::vector<std::shared_ptr<Function>> routes_;
+    std::map<std::string, Value> moduleCache_;
+
+    Value evalImpl(ExprPtr e, std::shared_ptr<Env> env) {
         switch (e->kind) {
             case EK::Num:  return vnum(e->num);
             case EK::Str:  return vstr(e->str);
@@ -95,7 +211,6 @@ public:
             }
 
             case EK::Call: {
-                // method call:  obj.method(args)
                 if (e->a->kind == EK::Member) {
                     Value obj = eval(e->a->a, env);
                     Value m   = getMethod(obj, e->a->str);
@@ -125,9 +240,7 @@ public:
         return vnil();
     }
 
-    // ---------- statements ----------
-
-    void exec(StmtPtr s, std::shared_ptr<Env> env) {
+    void execImpl(StmtPtr s, std::shared_ptr<Env> env) {
         switch (s->kind) {
 
             case SK::Let: {
@@ -231,48 +344,26 @@ public:
                 env->define(bind, mod);
                 break;
             }
+
+            case SK::Try: {
+                try {
+                    execBlock(s->body, env);
+                } catch (ThrowSignal& t) {
+                    auto scope = env->child();
+                    scope->define(s->name, t.value);
+                    for (auto& st : s->alt) exec(st, scope);
+                } catch (BiError& e) {
+                    auto scope = env->child();
+                    scope->define(s->name, vstr(e.what()));
+                    for (auto& st : s->alt) exec(st, scope);
+                }
+                break;
+            }
+
+            case SK::Throw:
+                throw ThrowSignal{ s->expr ? eval(s->expr, env) : vnil() };
         }
     }
-
-    void execBlock(const std::vector<StmtPtr>& body, std::shared_ptr<Env> env) {
-        auto scope = env->child();
-        for (auto& s : body) exec(s, scope);
-    }
-
-    // ---------- calls ----------
-
-    Value call(const Value& fn, ValueList& args) {
-        if (fn.type == Value::NATIVE) return fn.native(args);
-        if (fn.type == Value::FUNC)   return callFunction(fn.func, args);
-        throw std::runtime_error("attempt to call a " + typeName(fn));
-    }
-
-    Value callFunction(std::shared_ptr<Function> f, ValueList& args) {
-        auto env = f->closure->child();
-        for (size_t i = 0; i < f->params.size(); i++)
-            env->define(f->params[i], i < args.size() ? args[i] : vnil());
-
-        auto rest = std::make_shared<ValueList>();
-        for (size_t i = f->params.size(); i < args.size(); i++) rest->push_back(args[i]);
-        env->define("args", varr(rest));
-
-        try {
-            for (auto& s : f->body) exec(s, env);
-        } catch (ReturnSignal& r) {
-            return r.value;
-        }
-        return vnil();
-    }
-
-    // ---------- internals ----------
-
-    std::map<std::string, Value>* exportSink_ = nullptr;
-
-private:
-    std::shared_ptr<Env> global_;
-    std::string          baseDir_ = ".";
-    std::vector<std::shared_ptr<Function>> routes_;
-    std::map<std::string, Value> moduleCache_;
 
     Value evalBinary(ExprPtr e, std::shared_ptr<Env> env) {
         if (e->op == "&&") {
@@ -402,13 +493,16 @@ private:
     }
 
     std::string resolveModule(const std::string& name) {
-        // relative paths
-        if (name.rfind("./", 0) == 0 || name.rfind("../", 0) == 0 || name[0] == '/') {
+        if (name.rfind("./", 0) == 0 || name.rfind("../", 0) == 0) {
+            std::string p = baseDir_ + "/" + name;
+            if (p.size() < 3 || p.substr(p.size() - 3) != ".bi") p += ".bi";
+            return p;
+        }
+        if (!name.empty() && name[0] == '/') {
             std::string p = name;
             if (p.size() < 3 || p.substr(p.size() - 3) != ".bi") p += ".bi";
             return p;
         }
-        // installed packages
         const std::string candidates[] = {
             "bi_modules/" + name + "/src/main.bi",
             "bi_modules/" + name + "/index.bi",

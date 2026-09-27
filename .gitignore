@@ -1,1 +1,8 @@
-/target
+/bi
+/bi-linux-*
+/bi-macos-*
+/build/
+*.o
+*.a
+bi_modules/
+.DS_Store

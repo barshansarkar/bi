@@ -1,5 +1,6 @@
 #pragma once
 #include "value.hpp"
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -34,6 +35,18 @@ inline std::string defaultRegistry() {
     return v ? std::string(v) : std::string("http://localhost:8787");
 }
 
+// Only [A-Za-z0-9._-] allowed, no leading '-' or '.', no "..", reasonable length.
+inline bool isValidPackageName(const std::string& n) {
+    if (n.empty() || n.size() > 128) return false;
+    if (n[0] == '-' || n[0] == '.') return false;
+    if (n.find("..") != std::string::npos) return false;
+    for (char c : n) {
+        if (!(std::isalnum((unsigned char)c) || c == '_' || c == '-' || c == '.'))
+            return false;
+    }
+    return true;
+}
+
 inline std::string shellCapture(const std::string& cmd) {
     std::string out;
     FILE* p = popen(cmd.c_str(), "r");
@@ -47,7 +60,6 @@ inline std::string shellCapture(const std::string& cmd) {
 
 class Pkg {
 public:
-    // ---- bi init ----
     static int init() {
         if (fileExists("bi.json")) {
             std::cout << "bi: bi.json already exists\n";
@@ -76,8 +88,11 @@ public:
         return 0;
     }
 
-    // ---- bi new <name> ----
     static int newProject(const std::string& name) {
+        if (!isValidPackageName(name)) {
+            std::cerr << "bi: invalid project name '" << name << "'\n";
+            return 1;
+        }
         if (fileExists(name)) {
             std::cerr << "bi: directory '" << name << "' already exists\n";
             return 1;
@@ -104,8 +119,11 @@ public:
         return 0;
     }
 
-    // ---- bi install <name> ----
     static int install(const std::string& name) {
+        if (!isValidPackageName(name)) {
+            std::cerr << "bi: invalid package name '" << name << "'\n";
+            return 1;
+        }
         std::string reg = defaultRegistry();
         mkdir("bi_modules", 0755);
 
@@ -133,7 +151,6 @@ public:
         return 0;
     }
 
-    // ---- bi install  (all deps) ----
     static int installAll() {
         if (!fileExists("bi.json")) {
             std::cerr << "bi: no bi.json found — run 'bi init' first\n";
@@ -162,8 +179,11 @@ public:
         return rc;
     }
 
-    // ---- bi remove <name> ----
     static int remove(const std::string& name) {
+        if (!isValidPackageName(name)) {
+            std::cerr << "bi: invalid package name '" << name << "'\n";
+            return 1;
+        }
         std::string dir = "bi_modules/" + name;
         if (!fileExists(dir)) {
             std::cerr << "bi: package '" << name << "' is not installed\n";
@@ -188,7 +208,6 @@ public:
         return 0;
     }
 
-    // ---- bi list ----
     static int list() {
         if (!fileExists("bi_modules")) {
             std::cout << "bi: no packages installed\n";

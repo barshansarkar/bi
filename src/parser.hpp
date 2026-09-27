@@ -1,6 +1,7 @@
 #pragma once
 #include "ast.hpp"
 #include "token.hpp"
+#include <cctype>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -119,6 +120,8 @@ private:
         if (check(Tok::For))    return forStmt();
         if (check(Tok::Return)) return returnStmt();
         if (check(Tok::Route))  return routeStmt();
+        if (check(Tok::Try))    return tryStmt();
+        if (check(Tok::Throw))  return throwStmt();
         if (check(Tok::Break))  { int l = cur().line; advance(); semi(); return mkStmt(SK::Break, l); }
         if (check(Tok::Continue)) { int l = cur().line; advance(); semi(); return mkStmt(SK::Continue, l); }
         if (check(Tok::Fn) && ahead().type == Tok::Ident) return fnDecl(false);
@@ -160,13 +163,12 @@ private:
         expect(Tok::For, "'for'");
         expect(Tok::LParen, "'('");
 
-        // for (x in expr)  |  for (let x in expr)
         if ((check(Tok::Let) || check(Tok::Var)) &&
             ahead().type == Tok::Ident && ahead(2).type == Tok::In) {
             advance(); advance();
             auto s = mkStmt(SK::ForIn, line);
             s->name = t_[p_ - 1].text;
-            advance(); // 'in'
+            advance();
             s->expr = expression();
             expect(Tok::RParen, "')'");
             s->body = blockBody();
@@ -175,7 +177,7 @@ private:
         if (check(Tok::Ident) && ahead().type == Tok::In) {
             auto s = mkStmt(SK::ForIn, line);
             s->name = advance().text;
-            advance(); // 'in'
+            advance();
             s->expr = expression();
             expect(Tok::RParen, "')'");
             s->body = blockBody();
@@ -221,10 +223,35 @@ private:
         expect(Tok::Route, "'route'");
         auto s = mkStmt(SK::Route, line);
         s->name = "GET";
-        if (check(Tok::Ident) && ahead().type == Tok::String)
-            s->name = advance().text;          // GET / POST / PUT / DELETE / PATCH
-        s->expr = expression();                 // path string
+        if (check(Tok::Ident) && ahead().type == Tok::String) {
+            s->name = advance().text;
+            for (auto& c : s->name) c = (char)std::toupper((unsigned char)c);
+        }
+        s->expr = expression();
         s->body = blockBody();
+        return s;
+    }
+
+    StmtPtr tryStmt() {
+        int line = cur().line;
+        expect(Tok::Try, "'try'");
+        auto s = mkStmt(SK::Try, line);
+        s->body = blockBody();
+        expect(Tok::Catch, "'catch'");
+        expect(Tok::LParen, "'('");
+        s->name = expect(Tok::Ident, "catch variable name").text;
+        expect(Tok::RParen, "')'");
+        s->alt = blockBody();
+        return s;
+    }
+
+    StmtPtr throwStmt() {
+        int line = cur().line;
+        expect(Tok::Throw, "'throw'");
+        auto s = mkStmt(SK::Throw, line);
+        if (!check(Tok::Semicolon) && !check(Tok::RBrace) && !check(Tok::End))
+            s->expr = expression();
+        semi();
         return s;
     }
 

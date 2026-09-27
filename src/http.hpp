@@ -176,11 +176,31 @@ private:
 
         // ---- body ----
         size_t contentLen = 0;
-        for (auto& kv : headers) {
-            std::string k = kv.first;
-            for (auto& ch : k) ch = (char)std::tolower((unsigned char)ch);
-            if (k == "content-length") contentLen = (size_t)std::stoul(kv.second);
+for (auto& kv : headers) {
+    std::string k = kv.first;
+    for (auto& ch : k) ch = (char)std::tolower((unsigned char)ch);
+    if (k == "content-length") {
+        try {
+            unsigned long long n = std::stoull(kv.second);
+            if (n > (1ULL << 30)) n = (1ULL << 30);   // 1 GiB cap
+            contentLen = (size_t)n;
+        } catch (...) {
+            Response resp;
+            resp.status = 400;
+            resp.contentType = "text/plain; charset=utf-8";
+            resp.body = "bad Content-Length";
+            std::ostringstream r;
+            r << "HTTP/1.1 400 Bad Request\r\n"
+              << "Content-Type: " << resp.contentType << "\r\n"
+              << "Content-Length: " << resp.body.size() << "\r\n"
+              << "Connection: close\r\n\r\n"
+              << resp.body;
+            sendAll(fd, r.str());
+            close(fd);
+            return;
         }
+    }
+}
         while (body.size() < contentLen) {
             ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
             if (n <= 0) break;

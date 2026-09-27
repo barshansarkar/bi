@@ -7,6 +7,7 @@ enum class Tok {
     End, Number, String, Ident,
     Let, Var, Fn, Return, If, Else, While, For, In, True, False, Null,
     Import, Export, Route, As, Break, Continue,
+    Try, Catch, Throw,
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
     Comma, Dot, Colon, Semicolon,
     Plus, Minus, Star, Slash, Percent,

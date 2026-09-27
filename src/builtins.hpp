@@ -3,15 +3,21 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <random>
 #include <sstream>
 
+#ifdef BI_HAVE_CURL
+#include <curl/curl.h>
+#endif
+
 namespace bi {
 
-// Set by Interpreter so higher-order builtins can call .bi functions.
-inline std::function<Value(const Value&, ValueList&)> g_callFn;
+// Per-thread so that concurrently running routes don't clobber each other.
+inline thread_local std::function<Value(const Value&, ValueList&)> g_callFn;
 
 inline Value makeNative(NativeFn fn) {
     Value v;
@@ -40,14 +46,14 @@ inline std::string trim(const std::string& s) {
 // ---------------- member access ----------------
 
 inline Value getMember(const Value& o, const std::string& name) {
-    if (o.type == Value::MAP) {
-        auto it = o.map->find(name);
-        return it != o.map->end() ? it->second : vnil();
-    }
     if (name == "length") {
         if (o.type == Value::ARR) return vnum((double)o.arr->size());
         if (o.type == Value::STR) return vnum((double)o.str.size());
         if (o.type == Value::MAP) return vnum((double)o.map->size());
+    }
+    if (o.type == Value::MAP) {
+        auto it = o.map->find(name);
+        return it != o.map->end() ? it->second : vnil();
     }
     return vnil();
 }
@@ -216,6 +222,58 @@ inline Value getMethod(const Value& o, const std::string& name) {
     return vnil();
 }
 
+// ---------------- libcurl helper ----------------
+
+#ifdef BI_HAVE_CURL
+inline size_t curlWriteCb(char* p, size_t s, size_t n, void* u) {
+    static_cast<std::string*>(u)->append(p, s * n);
+    return s * n;
+}
+
+inline bool httpFetch(const std::string& url,
+                      const std::string& method,
+                      const std::string& reqBody,
+                      const std::map<std::string, std::string>& headers,
+                      std::string& outBody,
+                      long& outStatus)
+{
+    CURL* c = curl_easy_init();
+    if (!c) return false;
+
+    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlWriteCb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &outBody);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "bi/0.3");
+
+    struct curl_slist* hdrList = nullptr;
+    for (auto& kv : headers)
+        hdrList = curl_slist_append(hdrList, (kv.first + ": " + kv.second).c_str());
+    if (hdrList) curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrList);
+
+    if (method == "POST") {
+        curl_easy_setopt(c, CURLOPT_POST, 1L);
+        curl_easy_setopt(c, CURLOPT_POSTFIELDS, reqBody.c_str());
+    } else if (method == "PUT") {
+        curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "PUT");
+        curl_easy_setopt(c, CURLOPT_POSTFIELDS, reqBody.c_str());
+    } else if (method != "GET") {
+        curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, method.c_str());
+        if (!reqBody.empty())
+            curl_easy_setopt(c, CURLOPT_POSTFIELDS, reqBody.c_str());
+    }
+
+    CURLcode rc = curl_easy_perform(c);
+    if (rc == CURLE_OK)
+        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &outStatus);
+
+    if (hdrList) curl_slist_free_all(hdrList);
+    curl_easy_cleanup(c);
+    return rc == CURLE_OK;
+}
+#endif
+
 // ---------------- global builtins ----------------
 
 inline void def(std::shared_ptr<Env> g, const std::string& name, NativeFn fn) {
@@ -250,9 +308,9 @@ inline void registerBuiltins(std::shared_ptr<Env> g) {
             throw std::runtime_error(a.size() > 1 ? toStr(a[1]) : "assertion failed");
         return vnil(); });
     def(g, "exit", [](ValueList& a) -> Value {
-    std::exit(a.empty() ? 0 : (int)toNum(a[0]));
-    return vnil(); // unreachable
-});
+        std::exit(a.empty() ? 0 : (int)toNum(a[0]));
+        return vnil();
+    });
 
     // --- collections ---
     def(g, "range", [](ValueList& a){
@@ -319,13 +377,25 @@ inline void registerBuiltins(std::shared_ptr<Env> g) {
         while ((p = s.find(from, p)) != std::string::npos) { s.replace(p, from.size(), to); p += to.size(); }
         return vstr(s); });
 
+    // --- data ---
+    def(g, "parseJson", [](ValueList& a){
+        if (a.empty()) return vnil();
+        return parseJson(toStr(a[0]));   // bi::parseJson from value.hpp
+    });
+    def(g, "env", [](ValueList& a){
+        if (a.empty()) return vstr("");
+        const char* v = std::getenv(toStr(a[0]).c_str());
+        if (v) return vstr(v);
+        return a.size() > 1 ? a[1] : vnil();
+    });
+
     // --- time & random ---
     def(g, "time", [](ValueList&){
         using namespace std::chrono;
         return vnum((double)duration_cast<milliseconds>(
             system_clock::now().time_since_epoch()).count() / 1000.0); });
     def(g, "random", [](ValueList&){
-        static std::mt19937_64 rng(std::random_device{}());
+        static thread_local std::mt19937_64 rng(std::random_device{}());
         std::uniform_real_distribution<double> d(0.0, 1.0);
         return vnum(d(rng)); });
 
@@ -343,11 +413,19 @@ inline void registerBuiltins(std::shared_ptr<Env> g) {
 
     // --- web ---
     def(g, "json", [](ValueList& a){
-        if (currentResponse) currentResponse->contentType = "application/json; charset=utf-8";
-        return vstr(a.empty() ? "null" : toJson(a[0])); });
+        std::string s = a.empty() ? "null" : toJson(a[0]);
+        if (currentResponse) {
+            currentResponse->contentType = "application/json; charset=utf-8";
+            currentResponse->body = s;
+        }
+        return vstr(s); });
     def(g, "html", [](ValueList& a){
-        if (currentResponse) currentResponse->contentType = "text/html; charset=utf-8";
-        return vstr(a.empty() ? "" : toStr(a[0])); });
+        std::string s = a.empty() ? "" : toStr(a[0]);
+        if (currentResponse) {
+            currentResponse->contentType = "text/html; charset=utf-8";
+            currentResponse->body = s;
+        }
+        return vstr(s); });
     def(g, "status", [](ValueList& a){
         if (currentResponse && !a.empty()) currentResponse->status = (int)toNum(a[0]);
         return vnil(); });
@@ -366,6 +444,44 @@ inline void registerBuiltins(std::shared_ptr<Env> g) {
         throw ServeSignal{port};
         return vnil(); // unreachable
     });
+
+    // --- HTTP client ---
+#ifdef BI_HAVE_CURL
+    def(g, "fetch", [](ValueList& a){
+        if (a.empty()) throw std::runtime_error("fetch: url required");
+        std::string url    = toStr(a[0]);
+        std::string method = "GET";
+        std::string body;
+        std::map<std::string, std::string> headers;
+
+        if (a.size() > 1 && a[1].type == Value::MAP) {
+            auto& opts = *a[1].map;
+            auto it = opts.find("method");
+            if (it != opts.end()) method = toStr(it->second);
+            it = opts.find("body");
+            if (it != opts.end()) body = toStr(it->second);
+            it = opts.find("headers");
+            if (it != opts.end() && it->second.type == Value::MAP)
+                for (auto& kv : *it->second.map)
+                    headers[kv.first] = toStr(kv.second);
+        }
+
+        std::string respBody;
+        long status = 0;
+        if (!httpFetch(url, method, body, headers, respBody, status))
+            throw std::runtime_error("fetch failed: " + url);
+
+        auto m = std::make_shared<ValueMap>();
+        (*m)["status"] = vnum((double)status);
+        (*m)["body"]   = vstr(respBody);
+        (*m)["ok"]     = vbool(status >= 200 && status < 300);
+        return vmap(m);
+    });
+#else
+    def(g, "fetch", [](ValueList&) -> Value {
+        throw std::runtime_error("fetch: rebuild with -DBI_HAVE_CURL -lcurl");
+    });
+#endif
 }
 
 } // namespace bi

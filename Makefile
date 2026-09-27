@@ -1,22 +1,25 @@
 CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter
-LDFLAGS  ?= -pthread
+LDFLAGS  ?=
+LDLIBS   ?= -pthread
 
-SRC = src/main.cpp
-BIN = bi
+# Enable fetch() if libcurl is available.
+# Comment these two lines out if you don't want curl:
+CXXFLAGS += -DBI_HAVE_CURL
+LDLIBS   += -lcurl
+
+SRC      := src/main.cpp
+BIN      := bi
+
+.PHONY: all clean test run
 
 all: $(BIN)
 
 $(BIN): $(SRC) src/*.hpp
-	$(CXX) $(CXXFLAGS) $(SRC) -o $(BIN) $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) $(SRC) -o $(BIN) $(LDFLAGS) $(LDLIBS)
 
-debug: CXXFLAGS = -std=c++17 -g -O0 -Wall -Wextra
-debug: clean $(BIN)
+test: $(BIN)
+	./$(BIN) test
 
 clean:
 	rm -f $(BIN)
-
-install: $(BIN)
-	install -m 755 $(BIN) /usr/local/bin/$(BIN)
-
-.PHONY: all debug clean install

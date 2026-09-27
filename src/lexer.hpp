@@ -135,6 +135,8 @@ private:
             {"import", Tok::Import}, {"export", Tok::Export},
             {"route", Tok::Route},   {"as", Tok::As},
             {"break", Tok::Break},   {"continue", Tok::Continue},
+            {"try", Tok::Try},       {"catch", Tok::Catch},
+            {"throw", Tok::Throw},
         };
 
         Token t;

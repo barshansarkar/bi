@@ -26,10 +26,10 @@ struct Expr {
     std::string op;
 
     ExprPtr a, b, c;
-    std::vector<ExprPtr> items;                          // array elems / call args
-    std::vector<std::pair<std::string, ExprPtr>> fields; // map entries
-    std::vector<std::string> params;                     // lambda params
-    std::vector<StmtPtr>     body;                       // lambda body
+    std::vector<ExprPtr> items;
+    std::vector<std::pair<std::string, ExprPtr>> fields;
+    std::vector<std::string> params;
+    std::vector<StmtPtr>     body;
 };
 
 inline ExprPtr mkExpr(EK k, int line) {
@@ -41,7 +41,8 @@ inline ExprPtr mkExpr(EK k, int line) {
 
 enum class SK {
     Let, Expr, Block, If, While, For, ForIn,
-    Return, Break, Continue, Func, Route, Import
+    Return, Break, Continue, Func, Route, Import,
+    Try, Throw
 };
 
 struct Stmt {
@@ -52,11 +53,11 @@ struct Stmt {
     std::vector<std::string> params;
     bool        exported = false;
 
-    ExprPtr expr;                 // let init / if cond / while cond / return val / route path
+    ExprPtr expr;                 // let init / if cond / while cond / return val / route path / throw value
     StmtPtr init;                 // for-init
     ExprPtr cond, step;           // for-cond / for-step
-    std::vector<StmtPtr> body;
-    std::vector<StmtPtr> alt;     // else branch
+    std::vector<StmtPtr> body;    // block / try-body
+    std::vector<StmtPtr> alt;     // else branch / catch-body
 };
 
 inline StmtPtr mkStmt(SK k, int line) {
