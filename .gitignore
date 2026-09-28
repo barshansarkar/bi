@@ -6,3 +6,5 @@ bi_modules/
 *.a
 *.tar.gz
 .DS_Store
+bi-linux-x86_64
+bi-linux-arm64
