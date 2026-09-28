@@ -11,7 +11,7 @@
 #include <string>
 #include <unistd.h>
 
-static const char* VERSION = "0.4.0";
+static const char* VERSION = "0.5.0";
 
 static void usage() {
     std::cout <<
@@ -35,31 +35,40 @@ static void usage() {
         "  help                   Print this message\n";
 }
 
-// ---- pretty error with source snippet ----
-static void printLocatedError(const std::string& file, int line, const std::string& msg) {
+static void printLocatedError(bi::Interpreter& interp,
+                              const std::string& file, int line, int col,
+                              const std::string& msg,
+                              const std::vector<bi::Frame>& trace) {
     std::cerr << "bi: " << msg << "\n";
-    if (file.empty() || line <= 0) return;
-
-    std::ifstream f(file);
-    if (!f) return;
-
-    std::string src;
-    int cur = 0;
-    while (std::getline(f, src)) if (++cur == line) break;
-    if (cur != line) return;
-
-    while (!src.empty() && (src.back() == '\r' || src.back() == '\n')) src.pop_back();
-
-    std::string lineNum = std::to_string(line);
-    std::string pad(lineNum.size(), ' ');
-    std::cerr << "  --> " << file << ":" << line << "\n";
-    std::cerr << " " << pad << " |\n";
-    std::cerr << " " << lineNum << " | " << src << "\n";
-    std::cerr << " " << pad << " | ^\n";
+    if (!file.empty() && line > 0) {
+        std::ifstream f(file);
+        if (f) {
+            std::string src;
+            int cur = 0;
+            while (std::getline(f, src)) if (++cur == line) break;
+            if (cur == line) {
+                while (!src.empty() && (src.back() == '\r' || src.back() == '\n'))
+                    src.pop_back();
+                std::string lineNum = std::to_string(line);
+                std::string pad(lineNum.size(), ' ');
+                std::cerr << "  --> " << file << ":" << line << ":" << col << "\n";
+                std::cerr << " " << pad << " |\n";
+                std::cerr << " " << lineNum << " | " << src << "\n";
+                std::cerr << " " << pad << " | " << std::string(std::max(0, col - 1), ' ') << "^\n";
+            }
+        }
+    }
+    if (!trace.empty()) {
+        std::cerr << "  stack trace:\n";
+        for (size_t i = trace.size(); i-- > 0; ) {
+            const auto& fr = trace[i];
+            std::cerr << "    at " << fr.function
+                      << " (" << fr.file << ":" << fr.line << ")\n";
+        }
+    }
 }
 
 int main(int argc, char** argv) {
-    // Bare `bi` on a TTY → REPL
     if (argc < 2) {
         if (isatty(fileno(stdin))) {
             bi::Interpreter interp;
@@ -135,11 +144,18 @@ int main(int argc, char** argv) {
         return 1;
 
     } catch (bi::BiError& e) {
-        printLocatedError(interp.currentFile(), e.line, e.what());
+        printLocatedError(interp, e.file.empty() ? interp.currentFile() : e.file,
+                          e.line, e.col, e.what(), e.trace);
+        return 1;
+    } catch (bi::BreakSignal&) {
+        std::cerr << "bi: 'break' outside loop\n";
+        return 1;
+    } catch (bi::ContinueSignal&) {
+        std::cerr << "bi: 'continue' outside loop\n";
         return 1;
     } catch (bi::ThrowSignal& t) {
-        printLocatedError(interp.currentFile(), interp.currentLine(),
-                          "unhandled throw: " + bi::toStr(t.value));
+        printLocatedError(interp, interp.currentFile(), interp.currentLine(), interp.currentCol(),
+                          "unhandled throw: " + bi::toStr(t.value), interp.frames());
         return 1;
     } catch (bi::ReturnSignal&) {
         std::cerr << "bi: return outside function\n";

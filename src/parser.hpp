@@ -50,8 +50,6 @@ private:
 
     void semi() { match(Tok::Semicolon); }
 
-    // ---------------- statements ----------------
-
     std::vector<StmtPtr> blockBody() {
         expect(Tok::LBrace, "'{'");
         std::vector<StmtPtr> out;
@@ -67,10 +65,10 @@ private:
         bool exp = false;
         if (match(Tok::Export)) exp = true;
 
-        if (check(Tok::Let) || check(Tok::Var)) {
-            int line = cur().line;
+        if (check(Tok::Let)) {
+            int line = cur().line, col = cur().col;
             advance();
-            auto s = mkStmt(SK::Let, line);
+            auto s = mkStmt(SK::Let, line, col);
             s->exported = exp;
             s->name = expect(Tok::Ident, "variable name").text;
             if (match(Tok::Assign)) s->expr = expression();
@@ -79,14 +77,14 @@ private:
         }
         if (check(Tok::Fn) && ahead().type == Tok::Ident) return fnDecl(exp);
         if (check(Tok::Import)) return importStmt();
-        if (exp) err("'export' must be followed by 'let', 'var' or 'fn'");
+        if (exp) err("'export' must be followed by 'let' or 'fn'");
         return statement();
     }
 
     StmtPtr fnDecl(bool exp) {
-        int line = cur().line;
+        int line = cur().line, col = cur().col;
         expect(Tok::Fn, "'fn'");
-        auto s = mkStmt(SK::Func, line);
+        auto s = mkStmt(SK::Func, line, col);
         s->exported = exp;
         s->name = expect(Tok::Ident, "function name").text;
         expect(Tok::LParen, "'('");
@@ -100,9 +98,9 @@ private:
     }
 
     StmtPtr importStmt() {
-        int line = cur().line;
+        int line = cur().line, col = cur().col;
         expect(Tok::Import, "'import'");
-        auto s = mkStmt(SK::Import, line);
+        auto s = mkStmt(SK::Import, line, col);
         s->name = expect(Tok::String, "module path").text;
         if (match(Tok::As)) s->alias = expect(Tok::Ident, "alias").text;
         semi();
@@ -111,7 +109,7 @@ private:
 
     StmtPtr statement() {
         if (check(Tok::LBrace)) {
-            auto s = mkStmt(SK::Block, cur().line);
+            auto s = mkStmt(SK::Block, cur().line, cur().col);
             s->body = blockBody();
             return s;
         }
@@ -122,20 +120,20 @@ private:
         if (check(Tok::Route))  return routeStmt();
         if (check(Tok::Try))    return tryStmt();
         if (check(Tok::Throw))  return throwStmt();
-        if (check(Tok::Break))  { int l = cur().line; advance(); semi(); return mkStmt(SK::Break, l); }
-        if (check(Tok::Continue)) { int l = cur().line; advance(); semi(); return mkStmt(SK::Continue, l); }
+        if (check(Tok::Break))    { int l = cur().line, c = cur().col; advance(); semi(); return mkStmt(SK::Break, l, c); }
+        if (check(Tok::Continue)) { int l = cur().line, c = cur().col; advance(); semi(); return mkStmt(SK::Continue, l, c); }
         if (check(Tok::Fn) && ahead().type == Tok::Ident) return fnDecl(false);
 
-        auto s = mkStmt(SK::Expr, cur().line);
+        auto s = mkStmt(SK::Expr, cur().line, cur().col);
         s->expr = expression();
         semi();
         return s;
     }
 
     StmtPtr ifStmt() {
-        int line = cur().line;
+        int line = cur().line, col = cur().col;
         expect(Tok::If, "'if'");
-        auto s = mkStmt(SK::If, line);
+        auto s = mkStmt(SK::If, line, col);
         expect(Tok::LParen, "'('");
         s->expr = expression();
         expect(Tok::RParen, "')'");
@@ -148,9 +146,9 @@ private:
     }
 
     StmtPtr whileStmt() {
-        int line = cur().line;
+        int line = cur().line, col = cur().col;
         expect(Tok::While, "'while'");
-        auto s = mkStmt(SK::While, line);
+        auto s = mkStmt(SK::While, line, col);
         expect(Tok::LParen, "'('");
         s->expr = expression();
         expect(Tok::RParen, "')'");
@@ -159,32 +157,32 @@ private:
     }
 
     StmtPtr forStmt() {
-        int line = cur().line;
+        int line = cur().line, col = cur().col;
         expect(Tok::For, "'for'");
-        expect(Tok::LParen, "'('");
 
-        if ((check(Tok::Let) || check(Tok::Var)) &&
-            ahead().type == Tok::Ident && ahead(2).type == Tok::In) {
-            advance(); advance();
-            auto s = mkStmt(SK::ForIn, line);
-            s->name = t_[p_ - 1].text;
+        // for let <name> in <expr> { ... }
+        if (check(Tok::Let) && ahead().type == Tok::Ident && ahead(2).type == Tok::In) {
             advance();
-            s->expr = expression();
-            expect(Tok::RParen, "')'");
-            s->body = blockBody();
-            return s;
-        }
-        if (check(Tok::Ident) && ahead().type == Tok::In) {
-            auto s = mkStmt(SK::ForIn, line);
+            auto s = mkStmt(SK::ForIn, line, col);
             s->name = advance().text;
             advance();
             s->expr = expression();
-            expect(Tok::RParen, "')'");
+            s->body = blockBody();
+            return s;
+        }
+        // for <name> in <expr> { ... }
+        if (check(Tok::Ident) && ahead().type == Tok::In) {
+            auto s = mkStmt(SK::ForIn, line, col);
+            s->name = advance().text;
+            advance();
+            s->expr = expression();
             s->body = blockBody();
             return s;
         }
 
-        auto s = mkStmt(SK::For, line);
+        // for (init; cond; step) { ... }
+        expect(Tok::LParen, "'('");
+        auto s = mkStmt(SK::For, line, col);
         if (!check(Tok::Semicolon)) s->init = forInit();
         expect(Tok::Semicolon, "';'");
         if (!check(Tok::Semicolon)) s->cond = expression();
@@ -196,22 +194,22 @@ private:
     }
 
     StmtPtr forInit() {
-        if (check(Tok::Let) || check(Tok::Var)) {
+        if (check(Tok::Let)) {
             advance();
-            auto d = mkStmt(SK::Let, cur().line);
+            auto d = mkStmt(SK::Let, cur().line, cur().col);
             d->name = expect(Tok::Ident, "variable name").text;
             if (match(Tok::Assign)) d->expr = expression();
             return d;
         }
-        auto e = mkStmt(SK::Expr, cur().line);
+        auto e = mkStmt(SK::Expr, cur().line, cur().col);
         e->expr = expression();
         return e;
     }
 
     StmtPtr returnStmt() {
-        int line = cur().line;
+        int line = cur().line, col = cur().col;
         expect(Tok::Return, "'return'");
-        auto s = mkStmt(SK::Return, line);
+        auto s = mkStmt(SK::Return, line, col);
         if (!check(Tok::Semicolon) && !check(Tok::RBrace) && !check(Tok::End))
             s->expr = expression();
         semi();
@@ -219,9 +217,9 @@ private:
     }
 
     StmtPtr routeStmt() {
-        int line = cur().line;
+        int line = cur().line, col = cur().col;
         expect(Tok::Route, "'route'");
-        auto s = mkStmt(SK::Route, line);
+        auto s = mkStmt(SK::Route, line, col);
         s->name = "GET";
         if (check(Tok::Ident) && ahead().type == Tok::String) {
             s->name = advance().text;
@@ -233,9 +231,9 @@ private:
     }
 
     StmtPtr tryStmt() {
-        int line = cur().line;
+        int line = cur().line, col = cur().col;
         expect(Tok::Try, "'try'");
-        auto s = mkStmt(SK::Try, line);
+        auto s = mkStmt(SK::Try, line, col);
         s->body = blockBody();
         expect(Tok::Catch, "'catch'");
         expect(Tok::LParen, "'('");
@@ -246,9 +244,9 @@ private:
     }
 
     StmtPtr throwStmt() {
-        int line = cur().line;
+        int line = cur().line, col = cur().col;
         expect(Tok::Throw, "'throw'");
-        auto s = mkStmt(SK::Throw, line);
+        auto s = mkStmt(SK::Throw, line, col);
         if (!check(Tok::Semicolon) && !check(Tok::RBrace) && !check(Tok::End))
             s->expr = expression();
         semi();
@@ -263,10 +261,10 @@ private:
         auto left = logicalOr();
         if (check(Tok::Assign) || check(Tok::PlusAssign) || check(Tok::MinusAssign) ||
             check(Tok::StarAssign) || check(Tok::SlashAssign)) {
-            int line = cur().line;
+            int line = cur().line, col = cur().col;
             std::string op = advance().text;
             auto right = assignment();
-            auto e = mkExpr(EK::Assign, line);
+            auto e = mkExpr(EK::Assign, line, col);
             e->op = op;
             e->a  = left;
             e->b  = right;
@@ -278,8 +276,8 @@ private:
     ExprPtr logicalOr() {
         auto e = logicalAnd();
         while (check(Tok::Or)) {
-            int line = cur().line; advance();
-            auto r = mkExpr(EK::Binary, line);
+            int line = cur().line, col = cur().col; advance();
+            auto r = mkExpr(EK::Binary, line, col);
             r->op = "||"; r->a = e; r->b = logicalAnd();
             e = r;
         }
@@ -289,8 +287,8 @@ private:
     ExprPtr logicalAnd() {
         auto e = equality();
         while (check(Tok::And)) {
-            int line = cur().line; advance();
-            auto r = mkExpr(EK::Binary, line);
+            int line = cur().line, col = cur().col; advance();
+            auto r = mkExpr(EK::Binary, line, col);
             r->op = "&&"; r->a = e; r->b = equality();
             e = r;
         }
@@ -300,9 +298,9 @@ private:
     ExprPtr equality() {
         auto e = comparison();
         while (check(Tok::Eq) || check(Tok::Neq)) {
-            int line = cur().line;
+            int line = cur().line, col = cur().col;
             std::string op = advance().text;
-            auto r = mkExpr(EK::Binary, line);
+            auto r = mkExpr(EK::Binary, line, col);
             r->op = op; r->a = e; r->b = comparison();
             e = r;
         }
@@ -312,9 +310,9 @@ private:
     ExprPtr comparison() {
         auto e = term();
         while (check(Tok::Lt) || check(Tok::Lte) || check(Tok::Gt) || check(Tok::Gte)) {
-            int line = cur().line;
+            int line = cur().line, col = cur().col;
             std::string op = advance().text;
-            auto r = mkExpr(EK::Binary, line);
+            auto r = mkExpr(EK::Binary, line, col);
             r->op = op; r->a = e; r->b = term();
             e = r;
         }
@@ -324,9 +322,9 @@ private:
     ExprPtr term() {
         auto e = factor();
         while (check(Tok::Plus) || check(Tok::Minus)) {
-            int line = cur().line;
+            int line = cur().line, col = cur().col;
             std::string op = advance().text;
-            auto r = mkExpr(EK::Binary, line);
+            auto r = mkExpr(EK::Binary, line, col);
             r->op = op; r->a = e; r->b = factor();
             e = r;
         }
@@ -336,9 +334,9 @@ private:
     ExprPtr factor() {
         auto e = unary();
         while (check(Tok::Star) || check(Tok::Slash) || check(Tok::Percent)) {
-            int line = cur().line;
+            int line = cur().line, col = cur().col;
             std::string op = advance().text;
-            auto r = mkExpr(EK::Binary, line);
+            auto r = mkExpr(EK::Binary, line, col);
             r->op = op; r->a = e; r->b = unary();
             e = r;
         }
@@ -347,9 +345,9 @@ private:
 
     ExprPtr unary() {
         if (check(Tok::Not) || check(Tok::Minus)) {
-            int line = cur().line;
+            int line = cur().line, col = cur().col;
             std::string op = advance().text;
-            auto e = mkExpr(EK::Unary, line);
+            auto e = mkExpr(EK::Unary, line, col);
             e->op = op;
             e->a  = unary();
             return e;
@@ -361,7 +359,7 @@ private:
         auto e = primary();
         for (;;) {
             if (match(Tok::LParen)) {
-                auto c = mkExpr(EK::Call, e->line);
+                auto c = mkExpr(EK::Call, e->line, e->col);
                 c->a = e;
                 if (!check(Tok::RParen)) {
                     do { c->items.push_back(expression()); } while (match(Tok::Comma));
@@ -369,12 +367,12 @@ private:
                 expect(Tok::RParen, "')'");
                 e = c;
             } else if (match(Tok::Dot)) {
-                auto m = mkExpr(EK::Member, e->line);
+                auto m = mkExpr(EK::Member, e->line, e->col);
                 m->a   = e;
                 m->str = expect(Tok::Ident, "property name").text;
                 e = m;
             } else if (match(Tok::LBracket)) {
-                auto i = mkExpr(EK::Index, e->line);
+                auto i = mkExpr(EK::Index, e->line, e->col);
                 i->a = e;
                 i->b = expression();
                 expect(Tok::RBracket, "']'");
@@ -385,14 +383,25 @@ private:
     }
 
     ExprPtr primary() {
-        int line = cur().line;
+        int line = cur().line, col = cur().col;
 
-        if (match(Tok::Number)) { auto e = mkExpr(EK::Num, line);  e->num = t_[p_-1].num;  return e; }
-        if (match(Tok::String)) { auto e = mkExpr(EK::Str, line);  e->str = t_[p_-1].text; return e; }
-        if (match(Tok::True))   { auto e = mkExpr(EK::Bool, line); e->boolean = true;      return e; }
-        if (match(Tok::False))  { auto e = mkExpr(EK::Bool, line); e->boolean = false;     return e; }
-        if (match(Tok::Null))   return mkExpr(EK::Nil, line);
-        if (match(Tok::Ident))  { auto e = mkExpr(EK::Ident, line); e->str = t_[p_-1].text; return e; }
+        if (check(Tok::Number)) {
+            advance();
+            const Token& tk = t_[p_ - 1];
+            if (tk.isInt) {
+                auto e = mkExpr(EK::Int, line, col);
+                e->inum = tk.inum;
+                return e;
+            }
+            auto e = mkExpr(EK::Num, line, col);
+            e->num = tk.num;
+            return e;
+        }
+        if (match(Tok::String)) { auto e = mkExpr(EK::Str, line, col);  e->str = t_[p_-1].text; return e; }
+        if (match(Tok::True))   { auto e = mkExpr(EK::Bool, line, col); e->boolean = true;      return e; }
+        if (match(Tok::False))  { auto e = mkExpr(EK::Bool, line, col); e->boolean = false;     return e; }
+        if (match(Tok::Null))   return mkExpr(EK::Nil, line, col);
+        if (match(Tok::Ident))  { auto e = mkExpr(EK::Ident, line, col); e->str = t_[p_-1].text; return e; }
 
         if (match(Tok::LParen)) {
             auto e = expression();
@@ -401,7 +410,7 @@ private:
         }
 
         if (match(Tok::LBracket)) {
-            auto e = mkExpr(EK::Array, line);
+            auto e = mkExpr(EK::Array, line, col);
             if (!check(Tok::RBracket)) {
                 do { e->items.push_back(expression()); } while (match(Tok::Comma));
             }
@@ -410,7 +419,7 @@ private:
         }
 
         if (match(Tok::LBrace)) {
-            auto e = mkExpr(EK::Map, line);
+            auto e = mkExpr(EK::Map, line, col);
             if (!check(Tok::RBrace)) {
                 do {
                     std::string key;
@@ -425,7 +434,7 @@ private:
         }
 
         if (match(Tok::Fn)) {
-            auto e = mkExpr(EK::Func, line);
+            auto e = mkExpr(EK::Func, line, col);
             expect(Tok::LParen, "'('");
             if (!check(Tok::RParen)) {
                 do { e->params.push_back(expect(Tok::Ident, "parameter name").text); }

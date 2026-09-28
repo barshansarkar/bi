@@ -15,6 +15,7 @@ public:
 
     std::vector<Token> run() {
         std::vector<Token> out;
+        out.reserve(src_.size() / 4 + 8);
         for (;;) {
             skipTrivia();
             if (pos_ >= src_.size()) break;
@@ -78,11 +79,14 @@ private:
     Token number() {
         std::string s;
         while (std::isdigit((unsigned char)peek())) s += adv();
+        bool isFloat = false;
         if (peek() == '.' && std::isdigit((unsigned char)peek(1))) {
+            isFloat = true;
             s += adv();
             while (std::isdigit((unsigned char)peek())) s += adv();
         }
         if (peek() == 'e' || peek() == 'E') {
+            isFloat = true;
             s += adv();
             if (peek() == '+' || peek() == '-') s += adv();
             while (std::isdigit((unsigned char)peek())) s += adv();
@@ -90,7 +94,18 @@ private:
         Token t;
         t.type = Tok::Number;
         t.text = s;
-        t.num  = std::stod(s);
+        if (isFloat) {
+            t.isInt = false;
+            t.num   = std::stod(s);
+        } else {
+            try {
+                t.inum  = std::stoll(s);
+                t.isInt = true;
+            } catch (...) {
+                t.isInt = false;
+                t.num   = std::stod(s);
+            }
+        }
         return t;
     }
 
@@ -126,7 +141,7 @@ private:
         while (std::isalnum((unsigned char)peek()) || peek() == '_') s += adv();
 
         static const std::unordered_map<std::string, Tok> kw = {
-            {"let", Tok::Let},       {"var", Tok::Var},
+            {"let", Tok::Let},
             {"fn", Tok::Fn},         {"return", Tok::Return},
             {"if", Tok::If},         {"else", Tok::Else},
             {"while", Tok::While},   {"for", Tok::For},

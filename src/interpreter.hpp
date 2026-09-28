@@ -27,29 +27,29 @@ struct ThrowSignal    : ControlSignal {
 
 class Interpreter {
 public:
+    static constexpr size_t kMaxDepth = 2000;
+
     Interpreter() {
         global_ = std::make_shared<Env>();
         g_callFn = [this](const Value& f, ValueList& a) { return call(f, a); };
+        frames_.reserve(kMaxDepth);
         registerBuiltins(global_);
     }
 
     std::shared_ptr<Env> globals() const { return global_; }
-
     const std::vector<std::shared_ptr<Function>>& routes() const { return routes_; }
     std::string baseDir() const { return baseDir_; }
     const std::string& currentFile() const { return currentFile_; }
     int currentLine() const { return currentLine_; }
-
-    // ---------- loading ----------
+    int currentCol()  const { return currentCol_; }
+    const std::vector<Frame>& frames() const { return frames_; }
 
     void runFile(const std::string& path) {
         std::ifstream f(path, std::ios::binary);
         if (!f) throw std::runtime_error("cannot open file: " + path);
         std::stringstream ss; ss << f.rdbuf();
-
         auto slash = path.find_last_of("/\\");
         baseDir_ = (slash == std::string::npos) ? "." : path.substr(0, slash);
-
         runSource(ss.str(), path);
     }
 
@@ -61,17 +61,13 @@ public:
         for (auto& s : prog.body) exec(s, global_);
     }
 
-    // REPL helper: runs src, and if the last statement is an expression,
-    // returns its value (hasValue = true). Otherwise hasValue = false.
     std::pair<bool, Value> runSourceRepl(const std::string& src, const std::string& file) {
         currentFile_ = file;
         Lexer  lx(src, file);
         Parser ps(lx.run(), file);
         Program prog = ps.parse();
-
-        bool  hasValue = false;
-        Value last     = vnil();
-
+        bool hasValue = false;
+        Value last = vnil();
         for (size_t i = 0; i < prog.body.size(); i++) {
             auto& s = prog.body[i];
             if (s->kind == SK::Expr && i + 1 == prog.body.size()) {
@@ -84,59 +80,28 @@ public:
         return { hasValue, last };
     }
 
-    // ---------- evaluation ----------
-
-    Value eval(ExprPtr e, std::shared_ptr<Env> env) {
-        int prevLine = currentLine_;
-        currentLine_ = e->line;
-        try {
-            Value v = evalImpl(e, env);
-            currentLine_ = prevLine;
-            return v;
-        } catch (BiError&) {
-            currentLine_ = prevLine;
-            throw;
-        } catch (ControlSignal&) {
-            currentLine_ = prevLine;
-            throw;
-        } catch (std::exception& ex) {
-            int ln = e->line;
-            currentLine_ = prevLine;
-            throw BiError(ex.what(), ln);
-        }
-    }
-
-    // ---------- statements ----------
-
-    void exec(StmtPtr s, std::shared_ptr<Env> env) {
-        int prevLine = currentLine_;
-        currentLine_ = s->line;
-        try {
-            execImpl(s, env);
-            currentLine_ = prevLine;
-        } catch (BiError&) {
-            currentLine_ = prevLine;
-            throw;
-        } catch (ControlSignal&) {
-            currentLine_ = prevLine;
-            throw;
-        } catch (std::exception& ex) {
-            int ln = s->line;
-            currentLine_ = prevLine;
-            throw BiError(ex.what(), ln);
-        }
-    }
-
-    void execBlock(const std::vector<StmtPtr>& body, std::shared_ptr<Env> env) {
-        auto scope = env->child();
-        for (auto& s : body) exec(s, scope);
-    }
-
-    // ---------- calls ----------
-
+    // ---- calls ----
     Value call(const Value& fn, ValueList& args) {
-        if (fn.type == Value::NATIVE) return fn.native(args);
-        if (fn.type == Value::FUNC)   return callFunction(fn.func, args);
+        if (fn.type == Value::NATIVE) {
+            return (*fn.nativePtr())(args);
+        }
+        if (fn.type == Value::FUNC) {
+            auto f = fn.funcPtr();
+            if (frames_.size() >= kMaxDepth) {
+                auto trace = frames_;
+                throw BiError("stack overflow (max depth " + std::to_string(kMaxDepth) + ")",
+                              currentLine_, currentCol_, currentFile_, std::move(trace));
+            }
+            frames_.push_back({ f->name, currentFile_, currentLine_, currentCol_ });
+            try {
+                Value r = callFunction(f, args);
+                frames_.pop_back();
+                return r;
+            } catch (...) {
+                frames_.pop_back();
+                throw;
+            }
+        }
         throw std::runtime_error("attempt to call a " + typeName(fn));
     }
 
@@ -145,19 +110,71 @@ public:
         for (size_t i = 0; i < f->params.size(); i++)
             env->define(f->params[i], i < args.size() ? args[i] : vnil());
 
-        auto rest = std::make_shared<ValueList>();
-        for (size_t i = f->params.size(); i < args.size(); i++) rest->push_back(args[i]);
-        env->define("args", varr(rest));
+        if (!f->params.empty()) {
+            auto rest = std::make_shared<ValueList>();
+            for (size_t i = f->params.size(); i < args.size(); i++) rest->push_back(args[i]);
+            env->define("args", varr(std::move(rest)));
+        }
 
         try {
             for (auto& s : f->body) exec(s, env);
         } catch (ReturnSignal& r) {
-            return r.value;
+            return std::move(r.value);
         }
         return vnil();
     }
 
-    // Set by the module loader while executing an imported file.
+    // ---- exec / eval ----
+    void exec(StmtPtr s, std::shared_ptr<Env> env) {
+        int prevLine = currentLine_;
+        int prevCol  = currentCol_;
+        currentLine_ = s->line;
+        currentCol_  = s->col;
+        try {
+            execImpl(s, env);
+            currentLine_ = prevLine;
+            currentCol_  = prevCol;
+        } catch (BiError&) {
+            currentLine_ = prevLine; currentCol_ = prevCol; throw;
+        } catch (ControlSignal&) {
+            currentLine_ = prevLine; currentCol_ = prevCol; throw;
+        } catch (std::exception& ex) {
+            int ln = s->line, cl = s->col;
+            auto trace = frames_;
+            auto file = currentFile_;
+            currentLine_ = prevLine; currentCol_ = prevCol;
+            throw BiError(ex.what(), ln, cl, file, std::move(trace));
+        }
+    }
+
+    Value eval(ExprPtr e, std::shared_ptr<Env> env) {
+        int prevLine = currentLine_;
+        int prevCol  = currentCol_;
+        currentLine_ = e->line;
+        currentCol_  = e->col;
+        try {
+            Value v = evalImpl(e, env);
+            currentLine_ = prevLine;
+            currentCol_  = prevCol;
+            return v;
+        } catch (BiError&) {
+            currentLine_ = prevLine; currentCol_ = prevCol; throw;
+        } catch (ControlSignal&) {
+            currentLine_ = prevLine; currentCol_ = prevCol; throw;
+        } catch (std::exception& ex) {
+            int ln = e->line, cl = e->col;
+            auto trace = frames_;
+            auto file = currentFile_;
+            currentLine_ = prevLine; currentCol_ = prevCol;
+            throw BiError(ex.what(), ln, cl, file, std::move(trace));
+        }
+    }
+
+    void execBlock(const std::vector<StmtPtr>& body, std::shared_ptr<Env> env) {
+        auto scope = env->child();
+        for (auto& s : body) exec(s, scope);
+    }
+
     ValueMap* exportSink_ = nullptr;
 
 private:
@@ -165,11 +182,14 @@ private:
     std::string          baseDir_ = ".";
     std::string          currentFile_;
     int                  currentLine_ = 0;
+    int                  currentCol_  = 0;
+    std::vector<Frame>   frames_;
     std::vector<std::shared_ptr<Function>> routes_;
     std::map<std::string, Value> moduleCache_;
 
     Value evalImpl(ExprPtr e, std::shared_ptr<Env> env) {
         switch (e->kind) {
+            case EK::Int:  return vint(e->inum);
             case EK::Num:  return vnum(e->num);
             case EK::Str:  return vstr(e->str);
             case EK::Bool: return vbool(e->boolean);
@@ -183,20 +203,24 @@ private:
 
             case EK::Array: {
                 auto list = std::make_shared<ValueList>();
+                list->reserve(e->items.size());
                 for (auto& it : e->items) list->push_back(eval(it, env));
-                return varr(list);
+                return varr(std::move(list));
             }
 
             case EK::Map: {
                 auto m = std::make_shared<ValueMap>();
                 for (auto& kv : e->fields) (*m)[kv.first] = eval(kv.second, env);
-                return vmap(m);
+                return vmap(std::move(m));
             }
 
             case EK::Unary: {
                 Value a = eval(e->a, env);
                 if (e->op == "!") return vbool(!truthy(a));
-                if (e->op == "-") return vnum(-toNum(a));
+                if (e->op == "-") {
+                    if (a.type == Value::INT) return vint(-a.i);
+                    return vnum(-toNum(a));
+                }
                 throw std::runtime_error("bad unary operator " + e->op);
             }
 
@@ -213,28 +237,40 @@ private:
             case EK::Call: {
                 if (e->a->kind == EK::Member) {
                     Value obj = eval(e->a->a, env);
-                    Value m   = getMethod(obj, e->a->str);
-                    if (m.type == Value::NATIVE) {
+                    const NativeFn* m = lookupMethod(obj, e->a->str);
+                    if (m) {
                         ValueList args;
-                        args.push_back(obj);
+                        args.reserve(1 + e->items.size());
+                        args.push_back(std::move(obj));
                         for (auto& a : e->items) args.push_back(eval(a, env));
-                        return m.native(args);
+                        return (*m)(args);
                     }
+                    Value mv = getMember(obj, e->a->str);
+                    if (mv.type == Value::NIL) {
+                        throw std::runtime_error(
+                            "no method or property '" + e->a->str +
+                            "' on value of type " + typeName(obj));
+                    }
+                    ValueList args;
+                    args.reserve(e->items.size());
+                    for (auto& a : e->items) args.push_back(eval(a, env));
+                    return call(mv, args);
                 }
                 Value callee = eval(e->a, env);
                 ValueList args;
+                args.reserve(e->items.size());
                 for (auto& a : e->items) args.push_back(eval(a, env));
                 return call(callee, args);
             }
 
             case EK::Func: {
                 auto f = std::make_shared<Function>();
-                f->name    = "lambda";
-                f->params  = e->params;
-                f->body    = e->body;
-                f->closure = env;
-                Value v; v.type = Value::FUNC; v.func = f;
-                return v;
+                f->name       = "lambda";
+                f->params     = e->params;
+                f->body       = e->body;
+                f->closure    = env;
+                f->sourceFile = currentFile_;
+                return vfunc(std::move(f));
             }
         }
         return vnil();
@@ -245,22 +281,18 @@ private:
 
             case SK::Let: {
                 Value v = s->expr ? eval(s->expr, env) : vnil();
-                env->define(s->name, v);
-                if (s->exported && exportSink_) (*exportSink_)[s->name] = v;
+                v = deepCopy(v);
+                env->define(s->name, std::move(v));
+                if (s->exported && exportSink_) (*exportSink_)[s->name] = *env->find(s->name);
                 break;
             }
 
-            case SK::Expr:
-                eval(s->expr, env);
-                break;
-
-            case SK::Block:
-                execBlock(s->body, env);
-                break;
+            case SK::Expr: eval(s->expr, env); break;
+            case SK::Block: execBlock(s->body, env); break;
 
             case SK::If: {
-                if (truthy(eval(s->expr, env)))    execBlock(s->body, env);
-                else if (!s->alt.empty())          execBlock(s->alt, env);
+                if (truthy(eval(s->expr, env))) execBlock(s->body, env);
+                else if (!s->alt.empty())       execBlock(s->alt, env);
                 break;
             }
 
@@ -292,34 +324,34 @@ private:
                 Value it = eval(s->expr, env);
                 auto scope = env->child();
                 auto iter = [&](const Value& v) {
-                    scope->define(s->name, v);
+                    scope->define(s->name, deepCopy(v));
                     try { execBlock(s->body, scope); return true; }
                     catch (BreakSignal&)    { return false; }
                     catch (ContinueSignal&) { return true; }
                 };
                 if (it.type == Value::ARR) {
-                    for (auto& x : *it.arr) if (!iter(x)) break;
+                    for (auto& x : *it.arrPtr()) if (!iter(x)) break;
                 } else if (it.type == Value::MAP) {
-                    for (auto& kv : *it.map) if (!iter(vstr(kv.first))) break;
+                    for (auto& kv : *it.mapPtr()) if (!iter(vstr(kv.first))) break;
                 } else if (it.type == Value::STR) {
-                    for (char c : it.str) if (!iter(vstr(std::string(1, c)))) break;
+                    for (auto& c : utf8::chars(it.strView())) if (!iter(vstr(c))) break;
                 }
                 break;
             }
 
             case SK::Return:
                 throw ReturnSignal{ s->expr ? eval(s->expr, env) : vnil() };
-
             case SK::Break:    throw BreakSignal{};
             case SK::Continue: throw ContinueSignal{};
 
             case SK::Func: {
                 auto f = std::make_shared<Function>();
-                f->name    = s->name;
-                f->params  = s->params;
-                f->body    = s->body;
-                f->closure = env;
-                Value v; v.type = Value::FUNC; v.func = f;
+                f->name       = s->name;
+                f->params     = s->params;
+                f->body       = s->body;
+                f->closure    = env;
+                f->sourceFile = currentFile_;
+                Value v = vfunc(f);
                 env->define(s->name, v);
                 if (s->exported && exportSink_) (*exportSink_)[s->name] = v;
                 break;
@@ -332,16 +364,17 @@ private:
                 f->closure     = env;
                 f->isRoute     = true;
                 f->routeMethod = s->name;
-                Value pv       = eval(s->expr, env);
-                f->routePath   = (pv.type == Value::STR) ? pv.str : toStr(pv);
-                routes_.push_back(f);
+                f->sourceFile  = currentFile_;
+                Value pv = eval(s->expr, env);
+                f->routePath = (pv.type == Value::STR) ? std::string(pv.strView()) : toStr(pv);
+                routes_.push_back(std::move(f));
                 break;
             }
 
             case SK::Import: {
                 Value mod = importModule(s->name);
                 std::string bind = s->alias.empty() ? moduleBase(s->name) : s->alias;
-                env->define(bind, mod);
+                env->define(bind, std::move(mod));
                 break;
             }
 
@@ -350,7 +383,7 @@ private:
                     execBlock(s->body, env);
                 } catch (ThrowSignal& t) {
                     auto scope = env->child();
-                    scope->define(s->name, t.value);
+                    scope->define(s->name, deepCopy(t.value));
                     for (auto& st : s->alt) exec(st, scope);
                 } catch (BiError& e) {
                     auto scope = env->child();
@@ -383,81 +416,204 @@ private:
         if (e->op == "==") return vbool(valueEquals(a, b));
         if (e->op == "!=") return vbool(!valueEquals(a, b));
 
+        bool aI = a.type == Value::INT;
+        bool bI = b.type == Value::INT;
+
         if (e->op == "+") {
-            if (a.type == Value::STR || b.type == Value::STR) return vstr(toStr(a) + toStr(b));
-            if (a.type == Value::ARR && b.type == Value::ARR) {
-                auto out = std::make_shared<ValueList>(*a.arr);
-                for (auto& x : *b.arr) out->push_back(x);
-                return varr(out);
+            if (a.type == Value::STR && b.type == Value::STR) {
+                std::string s;
+                s.reserve(a.strLen() + b.strLen());
+                s += a.strView();
+                s += b.strView();
+                return vstr(std::move(s));
             }
+            if (a.type == Value::STR || b.type == Value::STR)
+                return vstr(toStr(a) + toStr(b));
+            if (a.type == Value::ARR && b.type == Value::ARR) {
+                auto out = std::make_shared<ValueList>(*a.arrPtr());
+                for (auto& x : *b.arrPtr()) out->push_back(x);
+                return varr(std::move(out));
+            }
+            if (aI && bI) return vint(a.i + b.i);
             return vnum(toNum(a) + toNum(b));
         }
-        if (e->op == "-") return vnum(toNum(a) - toNum(b));
+        if (e->op == "-") {
+            if (aI && bI) return vint(a.i - b.i);
+            return vnum(toNum(a) - toNum(b));
+        }
         if (e->op == "*") {
-            if (a.type == Value::STR && b.type == Value::NUM) {
+            if (a.type == Value::STR && (bI || b.type == Value::NUM)) {
+                long long n = toInt(b);
+                if (n <= 0) return vstr("");
                 std::string out;
-                for (int i = 0; i < (int)b.num; i++) out += a.str;
-                return vstr(out);
+                out.reserve(a.strLen() * (size_t)n);
+                for (long long i = 0; i < n; i++) out += a.strView();
+                return vstr(std::move(out));
             }
+            if (aI && bI) return vint(a.i * b.i);
             return vnum(toNum(a) * toNum(b));
         }
         if (e->op == "/") {
+            if (aI && bI) {
+                if (b.i == 0) throw std::runtime_error("division by zero");
+                return vint(a.i / b.i);
+            }
             double d = toNum(b);
             if (d == 0) throw std::runtime_error("division by zero");
             return vnum(toNum(a) / d);
         }
         if (e->op == "%") {
+            if (aI && bI) {
+                if (b.i == 0) throw std::runtime_error("modulo by zero");
+                return vint(a.i % b.i);
+            }
             double d = toNum(b);
             if (d == 0) throw std::runtime_error("modulo by zero");
             return vnum(std::fmod(toNum(a), d));
         }
-        if (e->op == "<")  return vbool(toNum(a) <  toNum(b));
-        if (e->op == "<=") return vbool(toNum(a) <= toNum(b));
-        if (e->op == ">")  return vbool(toNum(a) >  toNum(b));
-        if (e->op == ">=") return vbool(toNum(a) >= toNum(b));
 
+                // String vs string: lexicographic comparison
+        if (a.type == Value::STR && b.type == Value::STR) {
+            int cmp = a.strView().compare(b.strView());
+            if (e->op == "<")  return vbool(cmp <  0);
+            if (e->op == "<=") return vbool(cmp <= 0);
+            if (e->op == ">")  return vbool(cmp >  0);
+            if (e->op == ">=") return vbool(cmp >= 0);
+        }
+
+        // Numeric comparison
+        if (aI && bI) {
+            if (e->op == "<")  return vbool(a.i <  b.i);
+            if (e->op == "<=") return vbool(a.i <= b.i);
+            if (e->op == ">")  return vbool(a.i >  b.i);
+            if (e->op == ">=") return vbool(a.i >= b.i);
+        } else {
+            double x = toNum(a), y = toNum(b);
+            if (e->op == "<")  return vbool(x <  y);
+            if (e->op == "<=") return vbool(x <= y);
+            if (e->op == ">")  return vbool(x >  y);
+            if (e->op == ">=") return vbool(x >= y);
+        }
         throw std::runtime_error("unknown binary operator " + e->op);
     }
 
-    Value evalAssign(ExprPtr e, std::shared_ptr<Env> env) {
-        Value rhs;
-        if (e->op == "=") {
-            rhs = eval(e->b, env);
-        } else {
-            Value cur = eval(e->a, env);
-            Value b   = eval(e->b, env);
-            if (e->op == "+=") {
-                rhs = (cur.type == Value::STR || b.type == Value::STR)
-                        ? vstr(toStr(cur) + toStr(b))
-                        : vnum(toNum(cur) + toNum(b));
-            } else if (e->op == "-=") rhs = vnum(toNum(cur) - toNum(b));
-            else if (e->op == "*=")   rhs = vnum(toNum(cur) * toNum(b));
-            else if (e->op == "/=") {
-                if (toNum(b) == 0) throw std::runtime_error("division by zero");
-                rhs = vnum(toNum(cur) / toNum(b));
+    static Value compound(const std::string& op, const Value& cur, const Value& b) {
+        bool aI = cur.type == Value::INT;
+        bool bI = b.type == Value::INT;
+        if (op == "+=") {
+            if (cur.type == Value::STR && b.type == Value::STR) {
+                std::string s;
+                s.reserve(cur.strLen() + b.strLen());
+                s += cur.strView();
+                s += b.strView();
+                return vstr(std::move(s));
             }
+            if (cur.type == Value::STR || b.type == Value::STR)
+                return vstr(toStr(cur) + toStr(b));
+            if (cur.type == Value::ARR && b.type == Value::ARR) {
+                auto out = std::make_shared<ValueList>(*cur.arrPtr());
+                for (auto& x : *b.arrPtr()) out->push_back(x);
+                return varr(std::move(out));
+            }
+            if (aI && bI) return vint(cur.i + b.i);
+            return vnum(toNum(cur) + toNum(b));
         }
+        if (op == "-=") {
+            if (aI && bI) return vint(cur.i - b.i);
+            return vnum(toNum(cur) - toNum(b));
+        }
+        if (op == "*=") {
+            if (aI && bI) return vint(cur.i * b.i);
+            return vnum(toNum(cur) * toNum(b));
+        }
+        if (op == "/=") {
+            if (aI && bI) {
+                if (b.i == 0) throw std::runtime_error("division by zero");
+                return vint(cur.i / b.i);
+            }
+            if (toNum(b) == 0) throw std::runtime_error("division by zero");
+            return vnum(toNum(cur) / toNum(b));
+        }
+        throw std::runtime_error("unknown compound operator " + op);
+    }
 
+    Value assignTo(ExprPtr target, Value rhs, std::shared_ptr<Env> env) {
+        if (target->kind == EK::Ident) {
+            env->assign(target->str, std::move(rhs));
+            return rhs;
+        }
+        if (target->kind == EK::Member) {
+            Value obj = eval(target->a, env);
+            if (obj.type == Value::MAP) {
+                (*obj.mapPtr())[target->str] = std::move(rhs);
+                return rhs;
+            }
+            throw std::runtime_error("cannot assign property on " + typeName(obj));
+        }
+        if (target->kind == EK::Index) {
+            Value obj = eval(target->a, env);
+            Value k   = eval(target->b, env);
+            if (obj.type == Value::ARR) {
+                long long i = toInt(k);
+                long long n = (long long)obj.arrPtr()->size();
+                if (i < 0) i += n;
+                if (i < 0 || i >= n)
+                    throw std::runtime_error("array index out of range: " + std::to_string(i));
+                (*obj.arrPtr())[(size_t)i] = std::move(rhs);
+                return rhs;
+            }
+            if (obj.type == Value::MAP) {
+                (*obj.mapPtr())[std::string(k.strView())] = std::move(rhs);
+                return rhs;
+            }
+            throw std::runtime_error("cannot index-assign on " + typeName(obj));
+        }
+        throw std::runtime_error("invalid assignment target");
+    }
+
+    Value evalAssign(ExprPtr e, std::shared_ptr<Env> env) {
+        if (e->op == "=") {
+            Value rhs = deepCopy(eval(e->b, env));
+            return assignTo(e->a, std::move(rhs), env);
+        }
+        // compound
         if (e->a->kind == EK::Ident) {
-            env->assign(e->a->str, rhs);
+            Value* p = env->find(e->a->str);
+            if (!p) throw std::runtime_error("undefined variable '" + e->a->str + "'");
+            Value b = eval(e->b, env);
+            Value rhs = compound(e->op, *p, b);
+            *p = std::move(rhs);
             return rhs;
         }
         if (e->a->kind == EK::Member) {
             Value obj = eval(e->a->a, env);
-            if (obj.type == Value::MAP) { (*obj.map)[e->a->str] = rhs; return rhs; }
-            throw std::runtime_error("cannot assign property on " + typeName(obj));
+            if (obj.type != Value::MAP)
+                throw std::runtime_error("cannot assign property on " + typeName(obj));
+            Value cur = getMember(obj, e->a->str);
+            Value b   = eval(e->b, env);
+            Value rhs = compound(e->op, cur, b);
+            (*obj.mapPtr())[e->a->str] = rhs;
+            return rhs;
         }
         if (e->a->kind == EK::Index) {
             Value obj = eval(e->a->a, env);
             Value k   = eval(e->a->b, env);
+            Value cur = index(obj, k);
+            Value b   = eval(e->b, env);
+            Value rhs = compound(e->op, cur, b);
             if (obj.type == Value::ARR) {
-                int i = (int)toNum(k);
-                if (i < 0 || i >= (int)obj.arr->size())
+                long long i = toInt(k);
+                long long n = (long long)obj.arrPtr()->size();
+                if (i < 0) i += n;
+                if (i < 0 || i >= n)
                     throw std::runtime_error("array index out of range: " + std::to_string(i));
-                (*obj.arr)[i] = rhs;
+                (*obj.arrPtr())[(size_t)i] = rhs;
                 return rhs;
             }
-            if (obj.type == Value::MAP) { (*obj.map)[toStr(k)] = rhs; return rhs; }
+            if (obj.type == Value::MAP) {
+                (*obj.mapPtr())[std::string(k.strView())] = rhs;
+                return rhs;
+            }
             throw std::runtime_error("cannot index-assign on " + typeName(obj));
         }
         throw std::runtime_error("invalid assignment target");
@@ -465,24 +621,22 @@ private:
 
     Value index(const Value& o, const Value& k) {
         if (o.type == Value::ARR) {
-            int i = (int)toNum(k);
-            if (i < 0) i += (int)o.arr->size();
-            if (i < 0 || i >= (int)o.arr->size()) return vnil();
-            return (*o.arr)[i];
+            long long i = toInt(k);
+            long long n = (long long)o.arrPtr()->size();
+            if (i < 0) i += n;
+            if (i < 0 || i >= n) return vnil();
+            return (*o.arrPtr())[(size_t)i];
         }
         if (o.type == Value::MAP) {
-            auto it = o.map->find(toStr(k));
-            return it != o.map->end() ? it->second : vnil();
+            auto& m = *o.mapPtr();
+            auto it = m.find(std::string(k.strView()));
+            return it != m.end() ? it->second : vnil();
         }
         if (o.type == Value::STR) {
-            int i = (int)toNum(k);
-            if (i < 0 || i >= (int)o.str.size()) return vnil();
-            return vstr(std::string(1, o.str[i]));
+            return vstr(utf8::charAt(o.strView(), toInt(k)));
         }
         return vnil();
     }
-
-    // ---------- modules ----------
 
     static std::string moduleBase(const std::string& path) {
         std::string p = path;
@@ -519,7 +673,6 @@ private:
 
     Value importModule(const std::string& name) {
         std::string path = resolveModule(name);
-
         auto cached = moduleCache_.find(path);
         if (cached != moduleCache_.end()) return cached->second;
 

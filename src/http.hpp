@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -73,6 +74,8 @@ inline const char* statusText(int code) {
         case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
+        case 413: return "Payload Too Large";
+        case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
         default:  return "OK";
     }
@@ -101,6 +104,7 @@ public:
 
         std::cout << "bi: .bi server listening on http://localhost:" << port_ << "\n";
         std::cout << "bi: " << interp_.routes().size() << " route(s) registered\n";
+        std::cout << "bi: NOTE: requests are serialized (Interpreter is not reentrant)\n";
         std::cout.flush();
 
         for (;;) {
@@ -108,6 +112,12 @@ public:
             socklen_t len = sizeof(cli);
             int fd = accept(srv, (sockaddr*)&cli, &len);
             if (fd < 0) continue;
+
+            timeval tv{};
+            tv.tv_sec  = 30;
+            tv.tv_usec = 0;
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
             std::thread([this, fd] { handle(fd); }).detach();
         }
     }
@@ -117,13 +127,27 @@ private:
     int             port_;
     std::mutex      mtx_;
 
+    static constexpr size_t kMaxHeaderBytes = 64 * 1024;
+    static constexpr size_t kMaxBodyBytes   = 1ULL << 30;
+
     static void sendAll(int fd, const std::string& data) {
         size_t sent = 0;
         while (sent < data.size()) {
-            ssize_t n = send(fd, data.data() + sent, data.size() - sent, 0);
+            ssize_t n = send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
             if (n <= 0) break;
             sent += (size_t)n;
         }
+    }
+
+    static void sendErrAndClose(int fd, int status, const std::string& msg) {
+        std::ostringstream r;
+        r << "HTTP/1.1 " << status << " " << statusText(status) << "\r\n"
+          << "Content-Type: text/plain; charset=utf-8\r\n"
+          << "Content-Length: " << msg.size() << "\r\n"
+          << "Connection: close\r\n\r\n"
+          << msg;
+        sendAll(fd, r.str());
+        close(fd);
     }
 
     static void trimInPlace(std::string& s) {
@@ -136,27 +160,36 @@ private:
     void handle(int fd) {
         std::string buf;
         char tmp[8192];
-        size_t headerEnd = std::string::npos;
 
-        while ((headerEnd = buf.find("\r\n\r\n")) == std::string::npos) {
+        size_t headerEnd = std::string::npos;
+        size_t scanned   = 0;
+        for (;;) {
+            headerEnd = buf.find("\r\n\r\n", scanned);
+            if (headerEnd != std::string::npos) break;
+
+            if (buf.size() > kMaxHeaderBytes) {
+                sendErrAndClose(fd, 431, "request header too large");
+                return;
+            }
+            scanned = buf.size() >= 3 ? buf.size() - 3 : 0;
+
             ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
             if (n <= 0) { close(fd); return; }
             buf.append(tmp, (size_t)n);
-            if (buf.size() > (1u << 20)) break;
         }
-        if (headerEnd == std::string::npos) { close(fd); return; }
 
         std::string head = buf.substr(0, headerEnd);
         std::string body = buf.substr(headerEnd + 4);
 
-        // ---- request line ----
         size_t lineEnd = head.find("\r\n");
         std::string reqLine = head.substr(0, lineEnd);
         std::istringstream rl(reqLine);
         std::string method, target, version;
-        rl >> method >> target >> version;
+        if (!(rl >> method >> target >> version)) {
+            sendErrAndClose(fd, 400, "malformed request line");
+            return;
+        }
 
-        // ---- headers ----
         std::map<std::string, std::string> headers;
         size_t pos = (lineEnd == std::string::npos) ? head.size() : lineEnd + 2;
         while (pos < head.size()) {
@@ -174,33 +207,25 @@ private:
             }
         }
 
-        // ---- body ----
         size_t contentLen = 0;
-for (auto& kv : headers) {
-    std::string k = kv.first;
-    for (auto& ch : k) ch = (char)std::tolower((unsigned char)ch);
-    if (k == "content-length") {
-        try {
-            unsigned long long n = std::stoull(kv.second);
-            if (n > (1ULL << 30)) n = (1ULL << 30);   // 1 GiB cap
-            contentLen = (size_t)n;
-        } catch (...) {
-            Response resp;
-            resp.status = 400;
-            resp.contentType = "text/plain; charset=utf-8";
-            resp.body = "bad Content-Length";
-            std::ostringstream r;
-            r << "HTTP/1.1 400 Bad Request\r\n"
-              << "Content-Type: " << resp.contentType << "\r\n"
-              << "Content-Length: " << resp.body.size() << "\r\n"
-              << "Connection: close\r\n\r\n"
-              << resp.body;
-            sendAll(fd, r.str());
-            close(fd);
-            return;
+        for (auto& kv : headers) {
+            std::string k = kv.first;
+            for (auto& ch : k) ch = (char)std::tolower((unsigned char)ch);
+            if (k == "content-length") {
+                try {
+                    unsigned long long n = std::stoull(kv.second);
+                    if (n > kMaxBodyBytes) {
+                        sendErrAndClose(fd, 413, "payload too large");
+                        return;
+                    }
+                    contentLen = (size_t)n;
+                } catch (...) {
+                    sendErrAndClose(fd, 400, "bad Content-Length");
+                    return;
+                }
+            }
         }
-    }
-}
+
         while (body.size() < contentLen) {
             ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
             if (n <= 0) break;
@@ -208,7 +233,6 @@ for (auto& kv : headers) {
         }
         if (body.size() > contentLen) body = body.substr(0, contentLen);
 
-        // ---- query string ----
         std::string path = target, rawQuery;
         size_t q = target.find('?');
         if (q != std::string::npos) { path = target.substr(0, q); rawQuery = target.substr(q + 1); }
@@ -230,7 +254,6 @@ for (auto& kv : headers) {
 
         path = urlDecode(path);
 
-        // ---- dispatch ----
         Response resp;
         std::string out = dispatch(method, path, body, headers, queryMap, resp);
 
@@ -307,12 +330,45 @@ for (auto& kv : headers) {
         try {
             for (auto& s : fn->body) interp_.exec(s, env);
         } catch (ReturnSignal& rs) {
-            out = rs.value;
+            out = std::move(rs.value);
+        } catch (BreakSignal&) {
+            currentResponse = prev;
+            resp.status      = 500;
+            resp.contentType = "text/plain; charset=utf-8";
+            resp.body        = "route handler: 'break' outside loop";
+            return vnil();
+        } catch (ContinueSignal&) {
+            currentResponse = prev;
+            resp.status      = 500;
+            resp.contentType = "text/plain; charset=utf-8";
+            resp.body        = "route handler: 'continue' outside loop";
+            return vnil();
+        } catch (ThrowSignal& t) {
+            currentResponse = prev;
+            resp.status      = 500;
+            resp.contentType = "text/html; charset=utf-8";
+            resp.body = std::string("<h1>500 Internal Server Error</h1><pre>")
+                      + toStr(t.value) + "</pre>";
+            return vnil();
+        } catch (BiError& e) {
+            currentResponse = prev;
+            resp.status      = 500;
+            resp.contentType = "text/html; charset=utf-8";
+            resp.body = std::string("<h1>500 Internal Server Error</h1><pre>")
+                      + e.what() + "</pre>";
+            if (e.line > 0) {
+                resp.body += "<p>at " + e.file + ":" + std::to_string(e.line) + "</p>";
+                for (auto& fr : e.trace)
+                    resp.body += "<p>  at " + fr.function + " (" +
+                                 fr.file + ":" + std::to_string(fr.line) + ")</p>";
+            }
+            return vnil();
         } catch (std::exception& ex) {
             currentResponse = prev;
             resp.status      = 500;
             resp.contentType = "text/html; charset=utf-8";
-            resp.body = std::string("<h1>500 Internal Server Error</h1><pre>") + ex.what() + "</pre>";
+            resp.body = std::string("<h1>500 Internal Server Error</h1><pre>")
+                      + ex.what() + "</pre>";
             return vnil();
         }
         currentResponse = prev;
@@ -321,7 +377,7 @@ for (auto& kv : headers) {
 
     std::string renderValue(const Value& v, Response& resp) {
         if (v.type == Value::NIL) return resp.body;
-        if (v.type == Value::STR) return v.str;
+        if (v.type == Value::STR) return std::string(v.strView());   // ← FIX
         if (v.type == Value::ARR || v.type == Value::MAP) {
             if (resp.contentType.find("json") == std::string::npos)
                 resp.contentType = "application/json; charset=utf-8";

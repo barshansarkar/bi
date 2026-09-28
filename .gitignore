@@ -1,8 +1,8 @@
-/bi
-/bi-linux-*
-/bi-macos-*
-/build/
-*.o
-*.a
+build/
+bi
 bi_modules/
+*.o
+*.so
+*.a
+*.tar.gz
 .DS_Store

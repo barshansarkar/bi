@@ -1,0 +1,5 @@
+assert("hello".upper() == "HELLO")
+assert("  x  ".trim() == "x")
+assert("a,b,c".split(",").length == 3)
+assert([3,1,2].sort().join(",") == "1,2,3")
+assert({a:1}.keys()[0] == "a")

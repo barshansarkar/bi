@@ -35,7 +35,6 @@ inline std::string defaultRegistry() {
     return v ? std::string(v) : std::string("http://localhost:8787");
 }
 
-// Only [A-Za-z0-9._-] allowed, no leading '-' or '.', no "..", reasonable length.
 inline bool isValidPackageName(const std::string& n) {
     if (n.empty() || n.size() > 128) return false;
     if (n[0] == '-' || n[0] == '.') return false;
@@ -167,13 +166,13 @@ public:
             std::cerr << "bi: bi.json must be an object\n";
             return 1;
         }
-        auto it = manifest.map->find("dependencies");
-        if (it == manifest.map->end() || it->second.type != Value::MAP) {
+        auto it = manifest.mapPtr()->find("dependencies");          // ← FIX
+        if (it == manifest.mapPtr()->end() || it->second.type != Value::MAP) {
             std::cout << "bi: no dependencies\n";
             return 0;
         }
         int rc = 0;
-        for (auto& kv : *it->second.map) {
+        for (auto& kv : *it->second.mapPtr()) {                     // ← FIX
             if (install(kv.first) != 0) rc = 1;
         }
         return rc;
@@ -196,9 +195,9 @@ public:
             try {
                 Value m = parseJson(readWholeFile("bi.json"));
                 if (m.type == Value::MAP) {
-                    auto it = m.map->find("dependencies");
-                    if (it != m.map->end() && it->second.type == Value::MAP) {
-                        it->second.map->erase(name);
+                    auto it = m.mapPtr()->find("dependencies");      // ← FIX
+                    if (it != m.mapPtr()->end() && it->second.type == Value::MAP) {
+                        it->second.mapPtr()->erase(name);            // ← FIX
                         writeWholeFile("bi.json", toJson(m));
                     }
                 }
@@ -226,8 +225,9 @@ public:
                 try {
                     Value m = parseJson(readWholeFile(mf));
                     if (m.type == Value::MAP) {
-                        auto it = m.map->find("version");
-                        if (it != m.map->end() && it->second.type == Value::STR) ver = it->second.str;
+                        auto it = m.mapPtr()->find("version");       // ← FIX
+                        if (it != m.mapPtr()->end() && it->second.type == Value::STR)
+                            ver = std::string(it->second.strView());  // ← FIX
                     }
                 } catch (...) {}
             }
@@ -242,12 +242,12 @@ private:
         try {
             Value m = parseJson(readWholeFile("bi.json"));
             if (m.type != Value::MAP) return;
-            auto it = m.map->find("dependencies");
-            if (it == m.map->end() || it->second.type != Value::MAP) {
-                (*m.map)["dependencies"] = vmap(std::make_shared<ValueMap>());
-                it = m.map->find("dependencies");
+            auto it = m.mapPtr()->find("dependencies");              // ← FIX
+            if (it == m.mapPtr()->end() || it->second.type != Value::MAP) {
+                (*m.mapPtr())["dependencies"] = vmap(std::make_shared<ValueMap>());  // ← FIX
+                it = m.mapPtr()->find("dependencies");                // ← FIX
             }
-            (*it->second.map)[name] = vstr("*");
+            (*it->second.mapPtr())[name] = vstr("*");                // ← FIX
             writeWholeFile("bi.json", toJson(m));
         } catch (...) {}
     }

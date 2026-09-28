@@ -1,6 +1,7 @@
 #pragma once
 #include "ast.hpp"
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -9,6 +10,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace bi {
@@ -18,8 +20,7 @@ struct Function;
 struct Env;
 
 // ============================================================
-//  Insertion-order map (like JS Map / Python dict).
-//  API-compatible subset of std::map used by the interpreter.
+//  Insertion-order map
 // ============================================================
 template <typename V>
 class OrderedMapT {
@@ -44,7 +45,6 @@ public:
             if (it->first == k) return it;
         return items_.end();
     }
-
     size_t count(const std::string& k) const {
         for (auto& p : items_) if (p.first == k) return 1;
         return 0;
@@ -57,13 +57,11 @@ public:
         items_.emplace_back(k, V{});
         return items_.back().second;
     }
-
     size_t erase(const std::string& k) {
         for (auto it = items_.begin(); it != items_.end(); ++it)
             if (it->first == k) { items_.erase(it); return 1; }
         return 0;
     }
-
 private:
     Container items_;
 };
@@ -73,8 +71,7 @@ using ValueMap  = OrderedMapT<Value>;
 using NativeFn  = std::function<Value(ValueList&)>;
 
 // ============================================================
-//  Non-error unwind marker (so `catch(std::exception&)` won't
-//  accidentally swallow return/break/continue/serve).
+//  Signals
 // ============================================================
 struct ControlSignal {};
 
@@ -83,18 +80,25 @@ struct ServeSignal : ControlSignal {
     explicit ServeSignal(int p) : port(p) {}
 };
 
-// ============================================================
-//  Runtime error with optional source location.
-// ============================================================
-struct BiError : std::runtime_error {
-    int line = 0;
-    BiError(const std::string& msg, int ln = 0)
-        : std::runtime_error(msg), line(ln) {}
+struct Frame {
+    std::string function;
+    std::string file;
+    int         line = 0;
+    int         col  = 0;
 };
 
-// ============================================================
-//  HTTP response context (per-thread).
-// ============================================================
+struct BiError : std::runtime_error {
+    int line = 0;
+    int col  = 0;
+    std::string file;
+    std::vector<Frame> trace;
+
+    BiError(const std::string& msg, int ln = 0, int cl = 0,
+            std::string f = {}, std::vector<Frame> tr = {})
+        : std::runtime_error(msg),
+          line(ln), col(cl), file(std::move(f)), trace(std::move(tr)) {}
+};
+
 struct Response {
     int status = 200;
     std::string contentType = "text/html; charset=utf-8";
@@ -105,28 +109,172 @@ struct Response {
 inline thread_local Response* currentResponse = nullptr;
 
 // ============================================================
-//  Value
+//  Value — 32 bytes, SSO 22 chars, tagged union
 // ============================================================
 struct Value {
-    enum Type { NIL, NUM, BOOL, STR, ARR, MAP, FUNC, NATIVE };
+    enum Type : uint8_t {
+        NIL, INT, NUM, BOOL, STR, ARR, MAP, FUNC, NATIVE
+    };
 
-    Type        type = NIL;
-    double      num  = 0;
-    bool        boolean = false;
-    std::string str;
+    static constexpr size_t kSSOLen = 22;
 
-    std::shared_ptr<ValueList> arr;
-    std::shared_ptr<ValueMap>  map;
-    std::shared_ptr<Function>  func;
-    NativeFn                   native;
+    Type type      = NIL;
+    bool isHeapStr = false;   // STR only
+    uint8_t _pad[6] = {0,0,0,0,0,0};
+
+    union {
+        long long i;
+        double    num;
+        bool      boolean;
+    };
+    // 8 bytes (aligned)
+
+    struct SsoStr {
+        char    buf[kSSOLen];
+        uint8_t len;
+    };
+    union Payload {
+        SsoStr                sso;
+        std::shared_ptr<void> ref;
+        Payload()  { sso.len = 0; }
+        ~Payload() {}
+    } u;
+
+    // ---- ctor/dtor ----
+    Value() : type(NIL), isHeapStr(false), i(0) {}
+    Value(const Value& o) { copyInit(o); }
+    Value(Value&& o) noexcept { moveInit(std::move(o)); }
+    Value& operator=(const Value& o) {
+        if (this != &o) { this->~Value(); new (this) Value(o); }
+        return *this;
+    }
+    Value& operator=(Value&& o) noexcept {
+        if (this != &o) { this->~Value(); new (this) Value(std::move(o)); }
+        return *this;
+    }
+    ~Value() { destroy(); }
+
+    // ---- accessors ----
+    std::string_view strView() const {
+        if (type != STR) return {};
+        if (isHeapStr) return *static_cast<const std::string*>(u.ref.get());
+        return std::string_view(u.sso.buf, u.sso.len);
+    }
+    std::string strVal() const {
+        if (type != STR) return {};
+        if (isHeapStr) return *static_cast<const std::string*>(u.ref.get());
+        return std::string(u.sso.buf, u.sso.len);
+    }
+    size_t strLen() const { return strView().size(); }
+
+    void setStr(std::string_view s) {
+        destroy();
+        type = STR;
+        if (s.size() <= kSSOLen) {
+            std::memcpy(u.sso.buf, s.data(), s.size());
+            u.sso.len = (uint8_t)s.size();
+            isHeapStr = false;
+        } else {
+            new (&u.ref) std::shared_ptr<void>(std::make_shared<std::string>(s));
+            isHeapStr = true;
+        }
+    }
+
+    const NativeFn* nativePtr() const {
+        return static_cast<const NativeFn*>(u.ref.get());
+    }
+    std::shared_ptr<ValueList> arrPtr() const {
+        return std::static_pointer_cast<ValueList>(u.ref);
+    }
+    std::shared_ptr<ValueMap> mapPtr() const {
+        return std::static_pointer_cast<ValueMap>(u.ref);
+    }
+    std::shared_ptr<Function> funcPtr() const {
+        return std::static_pointer_cast<Function>(u.ref);
+    }
+
+private:
+    void destroy() {
+        switch (type) {
+            case STR:  if (isHeapStr) u.ref.~shared_ptr(); break;
+            case ARR: case MAP: case FUNC: case NATIVE:
+                u.ref.~shared_ptr(); break;
+            default: break;
+        }
+        type = NIL;
+        isHeapStr = false;
+        i = 0;
+    }
+    void copyInit(const Value& o) {
+        type = o.type;
+        isHeapStr = o.isHeapStr;
+        i = o.i;
+        switch (o.type) {
+            case STR:
+                if (o.isHeapStr) new (&u.ref) std::shared_ptr<void>(o.u.ref);
+                else             u.sso = o.u.sso;
+                break;
+            case ARR: case MAP: case FUNC: case NATIVE:
+                new (&u.ref) std::shared_ptr<void>(o.u.ref);
+                break;
+            default: u.sso.len = 0; break;
+        }
+    }
+    void moveInit(Value&& o) noexcept {
+        type = o.type;
+        isHeapStr = o.isHeapStr;
+        i = o.i;
+        switch (o.type) {
+            case STR:
+                if (o.isHeapStr) new (&u.ref) std::shared_ptr<void>(std::move(o.u.ref));
+                else             u.sso = o.u.sso;
+                break;
+            case ARR: case MAP: case FUNC: case NATIVE:
+                new (&u.ref) std::shared_ptr<void>(std::move(o.u.ref));
+                break;
+            default: u.sso.len = 0; break;
+        }
+        o.type = NIL;
+        o.isHeapStr = false;
+    }
 };
 
-inline Value vnil()  { Value v; v.type = Value::NIL;  return v; }
-inline Value vnum(double d)   { Value v; v.type = Value::NUM;  v.num = d; return v; }
-inline Value vbool(bool b)    { Value v; v.type = Value::BOOL; v.boolean = b; return v; }
-inline Value vstr(const std::string& s) { Value v; v.type = Value::STR; v.str = s; return v; }
-inline Value varr(std::shared_ptr<ValueList> a) { Value v; v.type = Value::ARR; v.arr = std::move(a); return v; }
-inline Value vmap(std::shared_ptr<ValueMap> m)  { Value v; v.type = Value::MAP; v.map = std::move(m); return v; }
+// ============================================================
+//  Factories
+// ============================================================
+inline Value vnil()  { return Value{}; }
+inline Value vint(long long i) {
+    Value v; v.type = Value::INT; v.i = i; return v;
+}
+inline Value vnum(double d) {
+    Value v; v.type = Value::NUM; v.num = d; return v;
+}
+inline Value vbool(bool b) {
+    Value v; v.type = Value::BOOL; v.boolean = b; return v;
+}
+inline Value vstr(std::string_view s) {
+    Value v; v.setStr(s); return v;
+}
+inline Value varr(std::shared_ptr<ValueList> a) {
+    Value v; v.type = Value::ARR;
+    new (&v.u.ref) std::shared_ptr<void>(std::move(a));
+    return v;
+}
+inline Value vmap(std::shared_ptr<ValueMap> m) {
+    Value v; v.type = Value::MAP;
+    new (&v.u.ref) std::shared_ptr<void>(std::move(m));
+    return v;
+}
+inline Value makeNative(NativeFn fn) {
+    Value v; v.type = Value::NATIVE;
+    new (&v.u.ref) std::shared_ptr<void>(std::make_shared<NativeFn>(std::move(fn)));
+    return v;
+}
+inline Value vfunc(std::shared_ptr<Function> f) {
+    Value v; v.type = Value::FUNC;
+    new (&v.u.ref) std::shared_ptr<void>(std::move(f));
+    return v;
+}
 
 struct Function {
     std::string              name;
@@ -137,6 +285,7 @@ struct Function {
     bool        isRoute = false;
     std::string routeMethod = "GET";
     std::string routePath   = "/";
+    std::string sourceFile;
 };
 
 struct Env : std::enable_shared_from_this<Env> {
@@ -148,15 +297,12 @@ struct Env : std::enable_shared_from_this<Env> {
         e->parent = shared_from_this();
         return e;
     }
-
     Value* find(const std::string& n) {
         auto it = vars.find(n);
         if (it != vars.end()) return &it->second;
         return parent ? parent->find(n) : nullptr;
     }
-
     void define(const std::string& n, Value v) { vars[n] = std::move(v); }
-
     void assign(const std::string& n, Value v) {
         Value* p = find(n);
         if (p) *p = std::move(v);
@@ -170,6 +316,7 @@ struct Env : std::enable_shared_from_this<Env> {
 inline std::string typeName(const Value& v) {
     switch (v.type) {
         case Value::NIL:    return "null";
+        case Value::INT:    return "int";
         case Value::NUM:    return "number";
         case Value::BOOL:   return "bool";
         case Value::STR:    return "string";
@@ -185,8 +332,9 @@ inline bool truthy(const Value& v) {
     switch (v.type) {
         case Value::NIL:  return false;
         case Value::BOOL: return v.boolean;
+        case Value::INT:  return v.i != 0;
         case Value::NUM:  return v.num != 0;
-        case Value::STR:  return !v.str.empty();
+        case Value::STR:  return v.strLen() != 0;
         default:          return true;
     }
 }
@@ -194,10 +342,27 @@ inline bool truthy(const Value& v) {
 inline double toNum(const Value& v) {
     switch (v.type) {
         case Value::NUM:  return v.num;
+        case Value::INT:  return (double)v.i;
         case Value::BOOL: return v.boolean ? 1 : 0;
         case Value::NIL:  return 0;
-        case Value::STR:
-            try { return std::stod(v.str); } catch (...) { return 0; }
+        case Value::STR: {
+            auto sv = v.strView();
+            try { return std::stod(std::string(sv)); } catch (...) { return 0; }
+        }
+        default: return 0;
+    }
+}
+
+inline long long toInt(const Value& v) {
+    switch (v.type) {
+        case Value::INT:  return v.i;
+        case Value::NUM:  return (long long)v.num;
+        case Value::BOOL: return v.boolean ? 1 : 0;
+        case Value::NIL:  return 0;
+        case Value::STR: {
+            auto sv = v.strView();
+            try { return std::stoll(std::string(sv)); } catch (...) { return 0; }
+        }
         default: return 0;
     }
 }
@@ -206,66 +371,166 @@ inline std::string toStr(const Value& v) {
     switch (v.type) {
         case Value::NIL:  return "null";
         case Value::BOOL: return v.boolean ? "true" : "false";
+        case Value::INT:  return std::to_string(v.i);
         case Value::NUM: {
             double d = v.num;
-            // Guard the cast so we never hit UB on huge doubles.
             if (std::fabs(d) < 9.0e15 && d == (double)(long long)d)
                 return std::to_string((long long)d);
-            std::ostringstream os; os << d; return os.str();
+            char buf[32];
+            std::snprintf(buf, sizeof buf, "%.17g", d);
+            return buf;
         }
-        case Value::STR: return v.str;
+        case Value::STR: return v.strVal();
         case Value::ARR: {
             std::string out = "[";
-            for (size_t i = 0; i < v.arr->size(); i++) {
+            const auto& a = *v.arrPtr();
+            for (size_t i = 0; i < a.size(); i++) {
                 if (i) out += ", ";
-                const Value& x = (*v.arr)[i];
-                out += (x.type == Value::STR) ? ("\"" + x.str + "\"") : toStr(x);
+                const Value& x = a[i];
+                if (x.type == Value::STR) { out += '"'; out += x.strVal(); out += '"'; }
+                else                      out += toStr(x);
             }
             return out + "]";
         }
         case Value::MAP: {
             std::string out = "{";
             bool first = true;
-            for (auto& kv : *v.map) {
+            for (auto& kv : *v.mapPtr()) {
                 if (!first) out += ", ";
                 first = false;
                 out += kv.first + ": " + toStr(kv.second);
             }
             return out + "}";
         }
-        case Value::FUNC:   return "<fn " + (v.func ? v.func->name : std::string("?")) + ">";
+        case Value::FUNC:   return "<fn " + (v.funcPtr() ? v.funcPtr()->name : std::string("?")) + ">";
         case Value::NATIVE: return "<native fn>";
     }
     return "";
 }
 
 inline bool valueEquals(const Value& a, const Value& b) {
-    if (a.type != b.type) {
-        if ((a.type == Value::NUM && b.type == Value::BOOL) ||
-            (a.type == Value::BOOL && b.type == Value::NUM))
-            return toNum(a) == toNum(b);
-        return false;
+    // numeric cross-compare
+    bool aNum = (a.type == Value::NUM || a.type == Value::INT);
+    bool bNum = (b.type == Value::NUM || b.type == Value::INT);
+    if (aNum && bNum) {
+        if (a.type == Value::INT && b.type == Value::INT) return a.i == b.i;
+        return toNum(a) == toNum(b);
     }
+    if (a.type != b.type) return false;
     switch (a.type) {
         case Value::NIL:  return true;
+        case Value::INT:  return a.i == b.i;
         case Value::NUM:  return a.num == b.num;
         case Value::BOOL: return a.boolean == b.boolean;
-        case Value::STR:  return a.str == b.str;
-        case Value::ARR:
-            if (a.arr->size() != b.arr->size()) return false;
-            for (size_t i = 0; i < a.arr->size(); i++)
-                if (!valueEquals((*a.arr)[i], (*b.arr)[i])) return false;
+        case Value::STR:  return a.strView() == b.strView();
+        case Value::ARR: {
+            auto& x = *a.arrPtr(); auto& y = *b.arrPtr();
+            if (x.size() != y.size()) return false;
+            for (size_t i = 0; i < x.size(); i++)
+                if (!valueEquals(x[i], y[i])) return false;
             return true;
-        case Value::MAP:
-            if (a.map->size() != b.map->size()) return false;
-            for (auto& kv : *a.map) {
-                auto it = b.map->find(kv.first);
-                if (it == b.map->end() || !valueEquals(kv.second, it->second)) return false;
+        }
+        case Value::MAP: {
+            auto& x = *a.mapPtr(); auto& y = *b.mapPtr();
+            if (x.size() != y.size()) return false;
+            for (auto& kv : x) {
+                auto it = y.find(kv.first);
+                if (it == y.end() || !valueEquals(kv.second, it->second)) return false;
             }
             return true;
-        default: return a.func == b.func;
+        }
+        default: return a.u.ref == b.u.ref;
     }
 }
+
+// ---- deepCopy: value semantics for local bindings ----
+inline Value deepCopy(const Value& v) {
+    switch (v.type) {
+        case Value::ARR: {
+            const auto& src = *v.arrPtr();
+            auto a = std::make_shared<ValueList>();
+            a->reserve(src.size());
+            for (auto& x : src) a->push_back(deepCopy(x));
+            return varr(std::move(a));
+        }
+        case Value::MAP: {
+            auto m = std::make_shared<ValueMap>();
+            for (auto& kv : *v.mapPtr()) (*m)[kv.first] = deepCopy(kv.second);
+            return vmap(std::move(m));
+        }
+        default: return v;   // fast path: scalar / function pointer
+    }
+}
+
+// ============================================================
+//  UTF-8 helpers
+// ============================================================
+namespace utf8 {
+
+inline size_t step(unsigned char c) {
+    if ((c & 0x80) == 0x00) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+inline size_t length(std::string_view s) {
+    size_t n = 0;
+    for (size_t i = 0; i < s.size(); ) {
+        size_t k = step((unsigned char)s[i]);
+        if (i + k > s.size()) k = 1;
+        i += k;
+        n++;
+    }
+    return n;
+}
+
+inline size_t byteOffset(std::string_view s, size_t cp) {
+    size_t i = 0, n = 0;
+    while (i < s.size() && n < cp) {
+        size_t k = step((unsigned char)s[i]);
+        if (i + k > s.size()) k = 1;
+        i += k;
+        n++;
+    }
+    return i;
+}
+
+inline std::string charAt(std::string_view s, long long idx) {
+    long long L = (long long)length(s);
+    if (idx < 0) idx += L;
+    if (idx < 0 || idx >= L) return "";
+    size_t b = byteOffset(s, (size_t)idx);
+    size_t k = step((unsigned char)s[b]);
+    if (b + k > s.size()) k = 1;
+    return std::string(s.substr(b, k));
+}
+
+inline std::string substr(std::string_view s, long long start, long long len) {
+    long long L = (long long)length(s);
+    if (start < 0) start += L;
+    if (start < 0) start = 0;
+    if (start >= L || len < 0) return "";
+    long long end = start + len;
+    if (end > L) end = L;
+    size_t b = byteOffset(s, (size_t)start);
+    size_t e = byteOffset(s, (size_t)end);
+    return std::string(s.substr(b, e - b));
+}
+
+inline std::vector<std::string> chars(std::string_view s) {
+    std::vector<std::string> out;
+    for (size_t i = 0; i < s.size(); ) {
+        size_t k = step((unsigned char)s[i]);
+        if (i + k > s.size()) k = 1;
+        out.emplace_back(s.substr(i, k));
+        i += k;
+    }
+    return out;
+}
+
+} // namespace utf8
 
 // ============================================================
 //  JSON
@@ -274,15 +539,18 @@ inline std::string toJson(const Value& v) {
     switch (v.type) {
         case Value::NIL:  return "null";
         case Value::BOOL: return v.boolean ? "true" : "false";
+        case Value::INT:  return std::to_string(v.i);
         case Value::NUM: {
             double d = v.num;
             if (std::fabs(d) < 9.0e15 && d == (double)(long long)d)
                 return std::to_string((long long)d);
-            std::ostringstream os; os << d; return os.str();
+            char buf[32];
+            std::snprintf(buf, sizeof buf, "%.17g", d);
+            return buf;
         }
         case Value::STR: {
             std::string out = "\"";
-            for (unsigned char c : v.str) {
+            for (unsigned char c : v.strView()) {
                 switch (c) {
                     case '"':  out += "\\\""; break;
                     case '\\': out += "\\\\"; break;
@@ -301,16 +569,17 @@ inline std::string toJson(const Value& v) {
         }
         case Value::ARR: {
             std::string out = "[";
-            for (size_t i = 0; i < v.arr->size(); i++) {
+            const auto& a = *v.arrPtr();
+            for (size_t i = 0; i < a.size(); i++) {
                 if (i) out += ",";
-                out += toJson((*v.arr)[i]);
+                out += toJson(a[i]);
             }
             return out + "]";
         }
         case Value::MAP: {
             std::string out = "{";
             bool first = true;
-            for (auto& kv : *v.map) {
+            for (auto& kv : *v.mapPtr()) {
                 if (!first) out += ",";
                 first = false;
                 out += "\"" + kv.first + "\":" + toJson(kv.second);
@@ -387,21 +656,29 @@ struct JsonParser {
             } else out += c;
         }
         if (i >= s.size()) err("unterminated string");
-        i++; // closing quote
+        i++;
         return out;
     }
 
     Value number() {
         size_t start = i;
         if (i < s.size() && (s[i] == '-' || s[i] == '+')) i++;
+        bool isFloat = false;
         while (i < s.size() && (std::isdigit((unsigned char)s[i]) || s[i]=='.' ||
-                                s[i]=='e' || s[i]=='E' || s[i]=='-' || s[i]=='+')) i++;
+                                s[i]=='e' || s[i]=='E' || s[i]=='-' || s[i]=='+')) {
+            if (s[i] == '.' || s[i] == 'e' || s[i] == 'E') isFloat = true;
+            i++;
+        }
         if (start == i) err("bad number");
-        return vnum(std::stod(s.substr(start, i - start)));
+        std::string tok = s.substr(start, i - start);
+        if (!isFloat) {
+            try { return vint(std::stoll(tok)); } catch (...) {}
+        }
+        return vnum(std::stod(tok));
     }
 
     Value object() {
-        i++; // {
+        i++;
         auto m = std::make_shared<ValueMap>();
         ws();
         if (i < s.size() && s[i] == '}') { i++; return vmap(m); }
@@ -421,7 +698,7 @@ struct JsonParser {
     }
 
     Value array() {
-        i++; // [
+        i++;
         auto a = std::make_shared<ValueList>();
         ws();
         if (i < s.size() && s[i] == ']') { i++; return varr(a); }

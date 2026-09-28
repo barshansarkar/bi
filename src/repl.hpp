@@ -53,7 +53,7 @@ inline int runRepl(Interpreter& interp) {
                              "  :globals       dump current globals\n";
                 continue;
             }
-            if (line == ":globals") {
+                        if (line == ":globals") {
                 for (auto& kv : interp.globals()->vars)
                     std::cout << "  " << kv.first << " = " << toStr(kv.second) << "\n";
                 continue;

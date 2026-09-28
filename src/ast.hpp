@@ -12,7 +12,7 @@ using ExprPtr = std::shared_ptr<Expr>;
 using StmtPtr = std::shared_ptr<Stmt>;
 
 enum class EK {
-    Num, Str, Bool, Nil, Ident,
+    Int, Num, Str, Bool, Nil, Ident,
     Array, Map, Unary, Binary, Call,
     Member, Index, Assign, Func
 };
@@ -20,7 +20,9 @@ enum class EK {
 struct Expr {
     EK          kind;
     int         line = 0;
+    int         col  = 0;
     double      num  = 0;
+    long long   inum = 0;
     std::string str;
     bool        boolean = false;
     std::string op;
@@ -32,10 +34,11 @@ struct Expr {
     std::vector<StmtPtr>     body;
 };
 
-inline ExprPtr mkExpr(EK k, int line) {
+inline ExprPtr mkExpr(EK k, int line, int col = 0) {
     auto e = std::make_shared<Expr>();
     e->kind = k;
     e->line = line;
+    e->col  = col;
     return e;
 }
 
@@ -48,22 +51,24 @@ enum class SK {
 struct Stmt {
     SK          kind;
     int         line = 0;
+    int         col  = 0;
     std::string name;
     std::string alias;
     std::vector<std::string> params;
     bool        exported = false;
 
-    ExprPtr expr;                 // let init / if cond / while cond / return val / route path / throw value
-    StmtPtr init;                 // for-init
-    ExprPtr cond, step;           // for-cond / for-step
-    std::vector<StmtPtr> body;    // block / try-body
-    std::vector<StmtPtr> alt;     // else branch / catch-body
+    ExprPtr expr;
+    StmtPtr init;
+    ExprPtr cond, step;
+    std::vector<StmtPtr> body;
+    std::vector<StmtPtr> alt;
 };
 
-inline StmtPtr mkStmt(SK k, int line) {
+inline StmtPtr mkStmt(SK k, int line, int col = 0) {
     auto s = std::make_shared<Stmt>();
     s->kind = k;
     s->line = line;
+    s->col  = col;
     return s;
 }
 
