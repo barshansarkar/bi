@@ -50,6 +50,69 @@ private:
 
     void semi() { match(Tok::Semicolon); }
 
+    // ============================================================
+    //  Constant folding
+    // ============================================================
+    static bool isNumLit(const ExprPtr& e) {
+        return e->kind == EK::Int || e->kind == EK::Num;
+    }
+    static double litNum(const ExprPtr& e) {
+        return e->kind == EK::Int ? (double)e->inum : e->num;
+    }
+
+    // Try to fold `a OP b` where both are numeric literals.
+    // Returns nullptr if not foldable.
+    static ExprPtr tryFoldNum(const std::string& op,
+                              const ExprPtr& a, const ExprPtr& b,
+                              int line, int col) {
+        if (!isNumLit(a) || !isNumLit(b)) return nullptr;
+        bool aInt = a->kind == EK::Int;
+        bool bInt = b->kind == EK::Int;
+
+        // Pure integer arithmetic
+        if (aInt && bInt) {
+            long long x = a->inum, y = b->inum;
+            if (op == "+") { auto e = mkExpr(EK::Int, line, col); e->inum = x + y; return e; }
+            if (op == "-") { auto e = mkExpr(EK::Int, line, col); e->inum = x - y; return e; }
+            if (op == "*") { auto e = mkExpr(EK::Int, line, col); e->inum = x * y; return e; }
+            if (op == "/") {
+                if (y == 0) return nullptr;   // let runtime raise
+                auto e = mkExpr(EK::Int, line, col); e->inum = x / y; return e;
+            }
+            if (op == "%") {
+                if (y == 0) return nullptr;
+                auto e = mkExpr(EK::Int, line, col); e->inum = x % y; return e;
+            }
+            if (op == "<")  { auto e = mkExpr(EK::Bool, line, col); e->boolean = x <  y; return e; }
+            if (op == "<=") { auto e = mkExpr(EK::Bool, line, col); e->boolean = x <= y; return e; }
+            if (op == ">")  { auto e = mkExpr(EK::Bool, line, col); e->boolean = x >  y; return e; }
+            if (op == ">=") { auto e = mkExpr(EK::Bool, line, col); e->boolean = x >= y; return e; }
+            if (op == "==") { auto e = mkExpr(EK::Bool, line, col); e->boolean = x == y; return e; }
+            if (op == "!=") { auto e = mkExpr(EK::Bool, line, col); e->boolean = x != y; return e; }
+            return nullptr;
+        }
+
+        // Float arithmetic
+        double x = litNum(a), y = litNum(b);
+        if (op == "+") { auto e = mkExpr(EK::Num, line, col); e->num = x + y; return e; }
+        if (op == "-") { auto e = mkExpr(EK::Num, line, col); e->num = x - y; return e; }
+        if (op == "*") { auto e = mkExpr(EK::Num, line, col); e->num = x * y; return e; }
+        if (op == "/") {
+            if (y == 0) return nullptr;
+            auto e = mkExpr(EK::Num, line, col); e->num = x / y; return e;
+        }
+        if (op == "<")  { auto e = mkExpr(EK::Bool, line, col); e->boolean = x <  y; return e; }
+        if (op == "<=") { auto e = mkExpr(EK::Bool, line, col); e->boolean = x <= y; return e; }
+        if (op == ">")  { auto e = mkExpr(EK::Bool, line, col); e->boolean = x >  y; return e; }
+        if (op == ">=") { auto e = mkExpr(EK::Bool, line, col); e->boolean = x >= y; return e; }
+        if (op == "==") { auto e = mkExpr(EK::Bool, line, col); e->boolean = x == y; return e; }
+        if (op == "!=") { auto e = mkExpr(EK::Bool, line, col); e->boolean = x != y; return e; }
+        return nullptr;
+    }
+
+    // ============================================================
+    //  Declarations
+    // ============================================================
     std::vector<StmtPtr> blockBody() {
         expect(Tok::LBrace, "'{'");
         std::vector<StmtPtr> out;
@@ -160,7 +223,6 @@ private:
         int line = cur().line, col = cur().col;
         expect(Tok::For, "'for'");
 
-        // for let <name> in <expr> { ... }
         if (check(Tok::Let) && ahead().type == Tok::Ident && ahead(2).type == Tok::In) {
             advance();
             auto s = mkStmt(SK::ForIn, line, col);
@@ -170,7 +232,6 @@ private:
             s->body = blockBody();
             return s;
         }
-        // for <name> in <expr> { ... }
         if (check(Tok::Ident) && ahead().type == Tok::In) {
             auto s = mkStmt(SK::ForIn, line, col);
             s->name = advance().text;
@@ -180,7 +241,6 @@ private:
             return s;
         }
 
-        // for (init; cond; step) { ... }
         expect(Tok::LParen, "'('");
         auto s = mkStmt(SK::For, line, col);
         if (!check(Tok::Semicolon)) s->init = forInit();
@@ -253,8 +313,9 @@ private:
         return s;
     }
 
-    // ---------------- expressions ----------------
-
+    // ============================================================
+    //  Expressions (with constant folding)
+    // ============================================================
     ExprPtr expression() { return assignment(); }
 
     ExprPtr assignment() {
@@ -300,8 +361,10 @@ private:
         while (check(Tok::Eq) || check(Tok::Neq)) {
             int line = cur().line, col = cur().col;
             std::string op = advance().text;
+            auto rhs = comparison();
+            if (auto f = tryFoldNum(op, e, rhs, line, col)) { e = f; continue; }
             auto r = mkExpr(EK::Binary, line, col);
-            r->op = op; r->a = e; r->b = comparison();
+            r->op = op; r->a = e; r->b = rhs;
             e = r;
         }
         return e;
@@ -312,8 +375,10 @@ private:
         while (check(Tok::Lt) || check(Tok::Lte) || check(Tok::Gt) || check(Tok::Gte)) {
             int line = cur().line, col = cur().col;
             std::string op = advance().text;
+            auto rhs = term();
+            if (auto f = tryFoldNum(op, e, rhs, line, col)) { e = f; continue; }
             auto r = mkExpr(EK::Binary, line, col);
-            r->op = op; r->a = e; r->b = term();
+            r->op = op; r->a = e; r->b = rhs;
             e = r;
         }
         return e;
@@ -324,8 +389,10 @@ private:
         while (check(Tok::Plus) || check(Tok::Minus)) {
             int line = cur().line, col = cur().col;
             std::string op = advance().text;
+            auto rhs = factor();
+            if (auto f = tryFoldNum(op, e, rhs, line, col)) { e = f; continue; }
             auto r = mkExpr(EK::Binary, line, col);
-            r->op = op; r->a = e; r->b = factor();
+            r->op = op; r->a = e; r->b = rhs;
             e = r;
         }
         return e;
@@ -336,8 +403,10 @@ private:
         while (check(Tok::Star) || check(Tok::Slash) || check(Tok::Percent)) {
             int line = cur().line, col = cur().col;
             std::string op = advance().text;
+            auto rhs = unary();
+            if (auto f = tryFoldNum(op, e, rhs, line, col)) { e = f; continue; }
             auto r = mkExpr(EK::Binary, line, col);
-            r->op = op; r->a = e; r->b = unary();
+            r->op = op; r->a = e; r->b = rhs;
             e = r;
         }
         return e;
@@ -347,9 +416,21 @@ private:
         if (check(Tok::Not) || check(Tok::Minus)) {
             int line = cur().line, col = cur().col;
             std::string op = advance().text;
+            auto inner = unary();
+            // Fold unary minus on numeric literals
+            if (op == "-" && inner->kind == EK::Int) {
+                auto e = mkExpr(EK::Int, line, col);
+                e->inum = -inner->inum;
+                return e;
+            }
+            if (op == "-" && inner->kind == EK::Num) {
+                auto e = mkExpr(EK::Num, line, col);
+                e->num = -inner->num;
+                return e;
+            }
             auto e = mkExpr(EK::Unary, line, col);
             e->op = op;
-            e->a  = unary();
+            e->a  = inner;
             return e;
         }
         return postfix();

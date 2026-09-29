@@ -14,6 +14,9 @@
 
 namespace bi {
 
+// ReturnSignal is kept ONLY for the top-level "return outside function" error
+// and for API compatibility with main.cpp / repl.hpp. It is NOT thrown inside
+// function bodies anymore.
 struct ReturnSignal : ControlSignal {
     Value value;
     explicit ReturnSignal(Value v) : value(std::move(v)) {}
@@ -58,7 +61,18 @@ public:
         Lexer  lx(src, file);
         Parser ps(lx.run(), file);
         Program prog = ps.parse();
-        for (auto& s : prog.body) exec(s, global_);
+
+        hasRet_ = false;
+        for (auto& s : prog.body) {
+            exec(s, global_);
+            if (hasRet_) {
+                // Top-level `return` — surface it as the classic error.
+                Value v = std::move(retVal_);
+                hasRet_ = false;
+                retVal_ = vnil();
+                throw ReturnSignal{ std::move(v) };
+            }
+        }
     }
 
     std::pair<bool, Value> runSourceRepl(const std::string& src, const std::string& file) {
@@ -66,8 +80,10 @@ public:
         Lexer  lx(src, file);
         Parser ps(lx.run(), file);
         Program prog = ps.parse();
+
         bool hasValue = false;
         Value last = vnil();
+        hasRet_ = false;
         for (size_t i = 0; i < prog.body.size(); i++) {
             auto& s = prog.body[i];
             if (s->kind == SK::Expr && i + 1 == prog.body.size()) {
@@ -75,6 +91,12 @@ public:
                 hasValue = true;
             } else {
                 exec(s, global_);
+                if (hasRet_) {
+                    Value v = std::move(retVal_);
+                    hasRet_ = false;
+                    retVal_ = vnil();
+                    throw ReturnSignal{ std::move(v) };
+                }
             }
         }
         return { hasValue, last };
@@ -107,21 +129,45 @@ public:
 
     Value callFunction(std::shared_ptr<Function> f, ValueList& args) {
         auto env = f->closure->child();
-        for (size_t i = 0; i < f->params.size(); i++)
-            env->define(f->params[i], i < args.size() ? args[i] : vnil());
+        const size_t np = f->params.size();
+        const size_t na = args.size();
 
-        if (!f->params.empty()) {
+        // Move args into params — safe: caller's `args` isn't reused after.
+        for (size_t i = 0; i < np; i++)
+            env->define(f->params[i], i < na ? std::move(args[i]) : vnil());
+
+        if (np > 0 && na > np) {
             auto rest = std::make_shared<ValueList>();
-            for (size_t i = f->params.size(); i < args.size(); i++) rest->push_back(args[i]);
+            rest->reserve(na - np);
+            for (size_t i = np; i < na; i++) rest->push_back(std::move(args[i]));
             env->define("args", varr(std::move(rest)));
         }
 
+        return callFunctionBody(f->body, env);
+    }
+
+    // Public so http.hpp / future callers can drive a body without exceptions.
+    Value callFunctionBody(const std::vector<StmtPtr>& body, std::shared_ptr<Env> env) {
+        bool  savedHasRet = hasRet_;
+        Value savedRet    = std::move(retVal_);
+        hasRet_ = false;
+        retVal_ = vnil();
+
         try {
-            for (auto& s : f->body) exec(s, env);
-        } catch (ReturnSignal& r) {
-            return std::move(r.value);
+            for (auto& s : body) {
+                exec(s, env);
+                if (hasRet_) break;
+            }
+        } catch (...) {
+            hasRet_ = savedHasRet;
+            retVal_ = std::move(savedRet);
+            throw;
         }
-        return vnil();
+
+        Value result = hasRet_ ? std::move(retVal_) : vnil();
+        hasRet_ = savedHasRet;
+        retVal_ = std::move(savedRet);
+        return result;
     }
 
     // ---- exec / eval ----
@@ -172,7 +218,10 @@ public:
 
     void execBlock(const std::vector<StmtPtr>& body, std::shared_ptr<Env> env) {
         auto scope = env->child();
-        for (auto& s : body) exec(s, scope);
+        for (auto& s : body) {
+            exec(s, scope);
+            if (hasRet_) return;
+        }
     }
 
     ValueMap* exportSink_ = nullptr;
@@ -186,6 +235,10 @@ private:
     std::vector<Frame>   frames_;
     std::vector<std::shared_ptr<Function>> routes_;
     std::map<std::string, Value> moduleCache_;
+
+    // Return propagation without exceptions.
+    Value retVal_;
+    bool  hasRet_ = false;
 
     Value evalImpl(ExprPtr e, std::shared_ptr<Env> env) {
         switch (e->kind) {
@@ -281,7 +334,6 @@ private:
 
             case SK::Let: {
                 Value v = s->expr ? eval(s->expr, env) : vnil();
-                v = deepCopy(v);
                 env->define(s->name, std::move(v));
                 if (s->exported && exportSink_) (*exportSink_)[s->name] = *env->find(s->name);
                 break;
@@ -301,6 +353,7 @@ private:
                     try { execBlock(s->body, env); }
                     catch (BreakSignal&)    { break; }
                     catch (ContinueSignal&) { continue; }
+                    if (hasRet_) break;
                 }
                 break;
             }
@@ -309,12 +362,14 @@ private:
                 auto scope = env->child();
                 if (s->init) exec(s->init, scope);
                 for (;;) {
+                    if (hasRet_) break;
                     if (s->cond && !truthy(eval(s->cond, scope))) break;
                     bool brk = false;
                     try { execBlock(s->body, scope); }
                     catch (BreakSignal&)    { brk = true; }
                     catch (ContinueSignal&) {}
-                    if (brk) break;
+                    if (brk)   break;
+                    if (hasRet_) break;
                     if (s->step) eval(s->step, scope);
                 }
                 break;
@@ -324,23 +379,26 @@ private:
                 Value it = eval(s->expr, env);
                 auto scope = env->child();
                 auto iter = [&](const Value& v) {
-                    scope->define(s->name, deepCopy(v));
+                    scope->define(s->name, v);
                     try { execBlock(s->body, scope); return true; }
                     catch (BreakSignal&)    { return false; }
                     catch (ContinueSignal&) { return true; }
                 };
                 if (it.type == Value::ARR) {
-                    for (auto& x : *it.arrPtr()) if (!iter(x)) break;
+                    for (auto& x : *it.arrPtr()) { if (!iter(x)) break; if (hasRet_) break; }
                 } else if (it.type == Value::MAP) {
-                    for (auto& kv : *it.mapPtr()) if (!iter(vstr(kv.first))) break;
+                    for (auto& kv : *it.mapPtr()) { if (!iter(vstr(kv.first))) break; if (hasRet_) break; }
                 } else if (it.type == Value::STR) {
-                    for (auto& c : utf8::chars(it.strView())) if (!iter(vstr(c))) break;
+                    for (auto& c : utf8::chars(it.strView())) { if (!iter(vstr(c))) break; if (hasRet_) break; }
                 }
                 break;
             }
 
             case SK::Return:
-                throw ReturnSignal{ s->expr ? eval(s->expr, env) : vnil() };
+                retVal_ = s->expr ? eval(s->expr, env) : vnil();
+                hasRet_ = true;
+                return;   // <-- no throw
+
             case SK::Break:    throw BreakSignal{};
             case SK::Continue: throw ContinueSignal{};
 
@@ -351,7 +409,7 @@ private:
                 f->body       = s->body;
                 f->closure    = env;
                 f->sourceFile = currentFile_;
-                Value v = vfunc(f);
+                Value v = vfunc(std::move(f));
                 env->define(s->name, v);
                 if (s->exported && exportSink_) (*exportSink_)[s->name] = v;
                 break;
@@ -383,12 +441,18 @@ private:
                     execBlock(s->body, env);
                 } catch (ThrowSignal& t) {
                     auto scope = env->child();
-                    scope->define(s->name, deepCopy(t.value));
-                    for (auto& st : s->alt) exec(st, scope);
+                    scope->define(s->name, std::move(t.value));
+                    for (auto& st : s->alt) {
+                        exec(st, scope);
+                        if (hasRet_) return;
+                    }
                 } catch (BiError& e) {
                     auto scope = env->child();
                     scope->define(s->name, vstr(e.what()));
-                    for (auto& st : s->alt) exec(st, scope);
+                    for (auto& st : s->alt) {
+                        exec(st, scope);
+                        if (hasRet_) return;
+                    }
                 }
                 break;
             }
@@ -399,12 +463,14 @@ private:
     }
 
     Value evalBinary(ExprPtr e, std::shared_ptr<Env> env) {
-        if (e->op == "&&") {
+        const std::string& op = e->op;
+
+        if (op == "&&") {
             Value a = eval(e->a, env);
             if (!truthy(a)) return vbool(false);
             return vbool(truthy(eval(e->b, env)));
         }
-        if (e->op == "||") {
+        if (op == "||") {
             Value a = eval(e->a, env);
             if (truthy(a)) return vbool(true);
             return vbool(truthy(eval(e->b, env)));
@@ -413,13 +479,32 @@ private:
         Value a = eval(e->a, env);
         Value b = eval(e->b, env);
 
-        if (e->op == "==") return vbool(valueEquals(a, b));
-        if (e->op == "!=") return vbool(!valueEquals(a, b));
+        // Fast path: int-int
+        if (a.type == Value::INT && b.type == Value::INT) {
+            long long x = a.i, y = b.i;
+            if (op == "+") return vint(x + y);
+            if (op == "-") return vint(x - y);
+            if (op == "*") return vint(x * y);
+            if (op == "/") {
+                if (y == 0) throw std::runtime_error("division by zero");
+                return vint(x / y);
+            }
+            if (op == "%") {
+                if (y == 0) throw std::runtime_error("modulo by zero");
+                return vint(x % y);
+            }
+            if (op == "<")  return vbool(x <  y);
+            if (op == "<=") return vbool(x <= y);
+            if (op == ">")  return vbool(x >  y);
+            if (op == ">=") return vbool(x >= y);
+            if (op == "==") return vbool(x == y);
+            if (op == "!=") return vbool(x != y);
+        }
 
-        bool aI = a.type == Value::INT;
-        bool bI = b.type == Value::INT;
+        if (op == "==") return vbool(valueEquals(a, b));
+        if (op == "!=") return vbool(!valueEquals(a, b));
 
-        if (e->op == "+") {
+        if (op == "+") {
             if (a.type == Value::STR && b.type == Value::STR) {
                 std::string s;
                 s.reserve(a.strLen() + b.strLen());
@@ -428,21 +513,17 @@ private:
                 return vstr(std::move(s));
             }
             if (a.type == Value::STR || b.type == Value::STR)
-                return vstr(toStr(a) + toStr(b));
+                return vstr(std::string(toStr(a)) + toStr(b));
             if (a.type == Value::ARR && b.type == Value::ARR) {
                 auto out = std::make_shared<ValueList>(*a.arrPtr());
                 for (auto& x : *b.arrPtr()) out->push_back(x);
                 return varr(std::move(out));
             }
-            if (aI && bI) return vint(a.i + b.i);
             return vnum(toNum(a) + toNum(b));
         }
-        if (e->op == "-") {
-            if (aI && bI) return vint(a.i - b.i);
-            return vnum(toNum(a) - toNum(b));
-        }
-        if (e->op == "*") {
-            if (a.type == Value::STR && (bI || b.type == Value::NUM)) {
+        if (op == "-") return vnum(toNum(a) - toNum(b));
+        if (op == "*") {
+            if (a.type == Value::STR && (b.type == Value::INT || b.type == Value::NUM)) {
                 long long n = toInt(b);
                 if (n <= 0) return vstr("");
                 std::string out;
@@ -450,51 +531,34 @@ private:
                 for (long long i = 0; i < n; i++) out += a.strView();
                 return vstr(std::move(out));
             }
-            if (aI && bI) return vint(a.i * b.i);
             return vnum(toNum(a) * toNum(b));
         }
-        if (e->op == "/") {
-            if (aI && bI) {
-                if (b.i == 0) throw std::runtime_error("division by zero");
-                return vint(a.i / b.i);
-            }
+        if (op == "/") {
             double d = toNum(b);
             if (d == 0) throw std::runtime_error("division by zero");
             return vnum(toNum(a) / d);
         }
-        if (e->op == "%") {
-            if (aI && bI) {
-                if (b.i == 0) throw std::runtime_error("modulo by zero");
-                return vint(a.i % b.i);
-            }
+        if (op == "%") {
             double d = toNum(b);
             if (d == 0) throw std::runtime_error("modulo by zero");
             return vnum(std::fmod(toNum(a), d));
         }
 
-                // String vs string: lexicographic comparison
         if (a.type == Value::STR && b.type == Value::STR) {
             int cmp = a.strView().compare(b.strView());
-            if (e->op == "<")  return vbool(cmp <  0);
-            if (e->op == "<=") return vbool(cmp <= 0);
-            if (e->op == ">")  return vbool(cmp >  0);
-            if (e->op == ">=") return vbool(cmp >= 0);
+            if (op == "<")  return vbool(cmp <  0);
+            if (op == "<=") return vbool(cmp <= 0);
+            if (op == ">")  return vbool(cmp >  0);
+            if (op == ">=") return vbool(cmp >= 0);
         }
 
-        // Numeric comparison
-        if (aI && bI) {
-            if (e->op == "<")  return vbool(a.i <  b.i);
-            if (e->op == "<=") return vbool(a.i <= b.i);
-            if (e->op == ">")  return vbool(a.i >  b.i);
-            if (e->op == ">=") return vbool(a.i >= b.i);
-        } else {
-            double x = toNum(a), y = toNum(b);
-            if (e->op == "<")  return vbool(x <  y);
-            if (e->op == "<=") return vbool(x <= y);
-            if (e->op == ">")  return vbool(x >  y);
-            if (e->op == ">=") return vbool(x >= y);
-        }
-        throw std::runtime_error("unknown binary operator " + e->op);
+        double x = toNum(a), y = toNum(b);
+        if (op == "<")  return vbool(x <  y);
+        if (op == "<=") return vbool(x <= y);
+        if (op == ">")  return vbool(x >  y);
+        if (op == ">=") return vbool(x >= y);
+
+        throw std::runtime_error("unknown binary operator " + op);
     }
 
     static Value compound(const std::string& op, const Value& cur, const Value& b) {
@@ -509,7 +573,7 @@ private:
                 return vstr(std::move(s));
             }
             if (cur.type == Value::STR || b.type == Value::STR)
-                return vstr(toStr(cur) + toStr(b));
+                return vstr(std::string(toStr(cur)) + toStr(b));
             if (cur.type == Value::ARR && b.type == Value::ARR) {
                 auto out = std::make_shared<ValueList>(*cur.arrPtr());
                 for (auto& x : *b.arrPtr()) out->push_back(x);
@@ -573,10 +637,9 @@ private:
 
     Value evalAssign(ExprPtr e, std::shared_ptr<Env> env) {
         if (e->op == "=") {
-            Value rhs = deepCopy(eval(e->b, env));
+            Value rhs = eval(e->b, env);
             return assignTo(e->a, std::move(rhs), env);
         }
-        // compound
         if (e->a->kind == EK::Ident) {
             Value* p = env->find(e->a->str);
             if (!p) throw std::runtime_error("undefined variable '" + e->a->str + "'");
@@ -690,7 +753,10 @@ private:
         auto* prevSink = exportSink_;
         exportSink_ = exports.get();
         try {
-            for (auto& s : prog.body) exec(s, mEnv);
+            for (auto& s : prog.body) {
+                exec(s, mEnv);
+                if (hasRet_) { hasRet_ = false; retVal_ = vnil(); }
+            }
         } catch (...) {
             exportSink_ = prevSink;
             throw;

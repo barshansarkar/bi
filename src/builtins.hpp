@@ -501,7 +501,7 @@ inline void registerBuiltins(std::shared_ptr<Env> g) {
         return vnil();
     });
 
-        def(g, "input", [](ValueList& a) -> Value {
+    def(g, "input", [](ValueList& a) -> Value {
         if (!a.empty()) std::cout << toStr(a[0]);
         std::cout.flush();
         std::string line;
@@ -552,6 +552,26 @@ inline void registerBuiltins(std::shared_ptr<Env> g) {
     def(g, "exit", [](ValueList& a) -> Value {
         std::exit(a.empty() ? 0 : (int)toInt(a[0]));
         return vnil();
+    });
+
+    // ---------- NEW: value/reference helpers ----------
+    // clone(x) -> deep copy. Use when you want value semantics for arrays/maps.
+    def(g, "clone", [](ValueList& a) {
+        return a.empty() ? vnil() : deepCopy(a[0]);
+    });
+    // same(a, b) -> true if a and b share the same underlying object (arrays/maps).
+    def(g, "same", [](ValueList& a) {
+        if (a.size() < 2) return vbool(false);
+        if (a[0].type != a[1].type) return vbool(false);
+        switch (a[0].type) {
+            case Value::ARR:
+            case Value::MAP:
+            case Value::FUNC:
+            case Value::NATIVE:
+                return vbool(a[0].u.ref == a[1].u.ref);
+            default:
+                return vbool(valueEquals(a[0], a[1]));
+        }
     });
 
     // ---------- collections ----------
@@ -748,7 +768,21 @@ inline void registerBuiltins(std::shared_ptr<Env> g) {
         int port = a.empty() ? 8080 : (int)toInt(a[0]);
         throw ServeSignal{port};
     });
+        // ---------- data ----------
+    def(g, "parseJson", [](ValueList& a) {
+        if (a.empty()) return vnil();
+        return parseJson(std::string(a[0].strView()));
+    });
 
+    // NEW — reverse direction
+    def(g, "toJson", [](ValueList& a) {
+        return vstr(toJson(a.empty() ? vnil() : a[0]));
+    });
+
+    // NEW — pretty-print value (useful for debugging)
+    def(g, "stringify", [](ValueList& a) {
+        return vstr(a.empty() ? "" : toStr(a[0]));
+    });
     // ---------- HTTP client ----------
 #ifdef BI_HAVE_CURL
     def(g, "fetch", [](ValueList& a) -> Value {

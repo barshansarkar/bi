@@ -11,7 +11,7 @@
 #include <string>
 #include <unistd.h>
 
-static const char* VERSION = "0.5.0";
+static const char* VERSION = "0.6.0";
 
 static void usage() {
     std::cout <<

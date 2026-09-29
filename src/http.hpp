@@ -326,11 +326,9 @@ private:
         Response* prev = currentResponse;
         currentResponse = &resp;
 
-        Value out;
+                Value out;
         try {
-            for (auto& s : fn->body) interp_.exec(s, env);
-        } catch (ReturnSignal& rs) {
-            out = std::move(rs.value);
+            out = interp_.callFunctionBody(fn->body, env);   // <-- no exception
         } catch (BreakSignal&) {
             currentResponse = prev;
             resp.status      = 500;

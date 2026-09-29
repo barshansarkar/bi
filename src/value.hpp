@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace bi {
@@ -20,7 +21,7 @@ struct Function;
 struct Env;
 
 // ============================================================
-//  Insertion-order map
+//  Insertion-order map with O(1) hash index
 // ============================================================
 template <typename V>
 class OrderedMapT {
@@ -36,34 +37,42 @@ public:
     const_iterator end()   const { return items_.end(); }
 
     iterator find(const std::string& k) {
-        for (auto it = items_.begin(); it != items_.end(); ++it)
-            if (it->first == k) return it;
-        return items_.end();
+        auto it = idx_.find(k);
+        if (it == idx_.end()) return items_.end();
+        return items_.begin() + (ptrdiff_t)it->second;
     }
     const_iterator find(const std::string& k) const {
-        for (auto it = items_.begin(); it != items_.end(); ++it)
-            if (it->first == k) return it;
-        return items_.end();
+        auto it = idx_.find(k);
+        if (it == idx_.end()) return items_.end();
+        return items_.begin() + (ptrdiff_t)it->second;
     }
-    size_t count(const std::string& k) const {
-        for (auto& p : items_) if (p.first == k) return 1;
-        return 0;
-    }
+    size_t count(const std::string& k) const { return idx_.count(k); }
     size_t size()  const { return items_.size(); }
     bool   empty() const { return items_.empty(); }
 
     V& operator[](const std::string& k) {
-        for (auto& p : items_) if (p.first == k) return p.second;
+        auto it = idx_.find(k);
+        if (it != idx_.end()) return items_[it->second].second;
         items_.emplace_back(k, V{});
+        idx_.emplace(k, items_.size() - 1);
         return items_.back().second;
     }
+
     size_t erase(const std::string& k) {
-        for (auto it = items_.begin(); it != items_.end(); ++it)
-            if (it->first == k) { items_.erase(it); return 1; }
-        return 0;
+        auto it = idx_.find(k);
+        if (it == idx_.end()) return 0;
+        size_t pos = it->second;
+        items_.erase(items_.begin() + (ptrdiff_t)pos);
+        idx_.erase(it);
+        // Reindex the tail (rare op, O(n) — fine)
+        for (size_t i = pos; i < items_.size(); ++i)
+            idx_[items_[i].first] = i;
+        return 1;
     }
+
 private:
-    Container items_;
+    Container                               items_;
+    std::unordered_map<std::string, size_t> idx_;
 };
 
 using ValueList = std::vector<Value>;
@@ -109,7 +118,7 @@ struct Response {
 inline thread_local Response* currentResponse = nullptr;
 
 // ============================================================
-//  Value — 32 bytes, SSO 22 chars, tagged union
+//  Value — 32-byte tagged union, 22-char SSO
 // ============================================================
 struct Value {
     enum Type : uint8_t {
@@ -119,7 +128,7 @@ struct Value {
     static constexpr size_t kSSOLen = 22;
 
     Type type      = NIL;
-    bool isHeapStr = false;   // STR only
+    bool isHeapStr = false;
     uint8_t _pad[6] = {0,0,0,0,0,0};
 
     union {
@@ -127,7 +136,6 @@ struct Value {
         double    num;
         bool      boolean;
     };
-    // 8 bytes (aligned)
 
     struct SsoStr {
         char    buf[kSSOLen];
@@ -444,6 +452,7 @@ inline bool valueEquals(const Value& a, const Value& b) {
 }
 
 // ---- deepCopy: value semantics for local bindings ----
+// Kept for the `clone()` builtin. NOT called on every `let` anymore.
 inline Value deepCopy(const Value& v) {
     switch (v.type) {
         case Value::ARR: {
