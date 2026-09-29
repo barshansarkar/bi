@@ -1,0 +1,7 @@
+/home/barshan/Desktop/bi/build-release/CMakeFiles/bi.dir
+/home/barshan/Desktop/bi/build-release/CMakeFiles/edit_cache.dir
+/home/barshan/Desktop/bi/build-release/CMakeFiles/rebuild_cache.dir
+/home/barshan/Desktop/bi/build-release/CMakeFiles/list_install_components.dir
+/home/barshan/Desktop/bi/build-release/CMakeFiles/install.dir
+/home/barshan/Desktop/bi/build-release/CMakeFiles/install/local.dir
+/home/barshan/Desktop/bi/build-release/CMakeFiles/install/strip.dir

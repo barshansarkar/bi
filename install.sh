@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # .bi language installer
-#   curl -fsSL https://github.com/YOURNAME/bi/raw/main/install.sh | bash
+#   curl -fsSL https://github.com/BarshanSarkar/bi/raw/main/install.sh | bash
 set -euo pipefail
 
-REPO="BarshanSarkar/bi"                 # <-- CHANGE THIS to your GitHub user/repo
+REPO="BarshanSarkar/bi"
 VERSION="${BI_VERSION:-latest}"
 INSTALL_DIR="${BI_INSTALL_DIR:-/usr/local/bin}"
 
@@ -22,14 +22,15 @@ case "$ARCH" in
   *) echo "error: unsupported arch: $ARCH" >&2; exit 1 ;;
 esac
 
-BIN="bi-${OS}-${ARCH}"
-
-# ---- resolve URL ----
+# ---- resolve version if "latest" ----
 if [ "$VERSION" = "latest" ]; then
-  URL="https://github.com/${REPO}/releases/latest/download/${BIN}"
-else
-  URL="https://github.com/${REPO}/releases/download/${VERSION}/${BIN}"
+  VERSION=$(curl -sSL "https://api.github.com/repos/${REPO}/releases/latest" \
+            | grep -oP '"tag_name":\s*"v\K[^"]+' | head -1 || true)
+  [ -z "$VERSION" ] && VERSION="0.6.0"
 fi
+
+BIN="bi-${VERSION}-${OS}-${ARCH}"
+URL="https://github.com/${REPO}/releases/download/v${VERSION}/${BIN}"
 
 echo "bi installer"
 echo "  platform : ${OS}-${ARCH}"
